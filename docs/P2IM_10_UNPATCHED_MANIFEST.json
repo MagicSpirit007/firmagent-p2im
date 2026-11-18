@@ -1,0 +1,393 @@
+{
+  "schema": "mcu-p2im/manifest-0.2",
+  "generated_at": "2026-11-17T17:21:56+0800",
+  "oracle_version": "0.2.0",
+  "host": {
+    "platform": "linux-x86_64",
+    "distro": "Ubuntu 24.04 LTS"
+  },
+  "sources": {
+    "p2im_real_firmware": "${P2IM_ROOT}/externals/p2im-real_firmware/binary",
+    "unpatched_est_data_set": "${HOEDUR_EXPERIMENTS_ROOT}/targets/arm/unpatched-est-data-set/P2IM"
+  },
+  "counts": {
+    "targets": 10,
+    "present": 10,
+    "with_svc_0x3f": 9
+  },
+  "targets": [
+    {
+      "target": "PLC",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/PLC",
+      "status": "ok",
+      "sha256": "783108cf8b9cf7f703a4164dfee7d12d9a9f79d663328a21454a70a7003c2b08",
+      "bytes": 781168,
+      "machine": 40,
+      "entry_raw": "0x08000d3d",
+      "flash_base": "0x08000000",
+      "ram_base": "0x08006008",
+      "vector_table_base": "0x08000000",
+      "vector_initial_sp": "0x20030000",
+      "vector_reset": "0x08000d3c",
+      "function_symbols": 363,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "stm32f4",
+        "expected": "stm32f4",
+        "scores": {
+          "stm32f4": 29,
+          "stm32f1": 13,
+          "sam3x": 0,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "STM32F429I-Discovery",
+        "mcu": "STM32F429ZI"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "CNC",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/CNC",
+      "status": "ok",
+      "sha256": "b5eb4e58c9a14abe37118210e33c918af56ebfbd6fe39da5e34480045e1b1d76",
+      "bytes": 305500,
+      "machine": 40,
+      "entry_raw": "0x080092c5",
+      "flash_base": "0x08000000",
+      "ram_base": "0x0800c0b4",
+      "vector_table_base": "0x08000000",
+      "vector_initial_sp": "0x2001ffff",
+      "vector_reset": "0x080092c4",
+      "function_symbols": 431,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "stm32f4",
+        "expected": "stm32f4",
+        "scores": {
+          "stm32f4": 31,
+          "stm32f1": 7,
+          "sam3x": 0,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "STM32F429I-Discovery",
+        "mcu": "STM32F429ZI"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "Gateway",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/Gateway",
+      "status": "ok",
+      "sha256": "53a61a7b9baa85275f6fd162c5f5f3d2bf5c417d559b53e0ff2a5fd4897a867b",
+      "bytes": 925564,
+      "machine": 40,
+      "entry_raw": "0x08003659",
+      "flash_base": "0x08000000",
+      "ram_base": "0x0800abe4",
+      "vector_table_base": "0x08000000",
+      "vector_initial_sp": "0x20005000",
+      "vector_reset": "0x08003658",
+      "function_symbols": 476,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "stm32f1",
+        "expected": "stm32f1",
+        "scores": {
+          "stm32f4": 10,
+          "stm32f1": 41,
+          "sam3x": 0,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "NUCLEO-F103RB",
+        "mcu": "STM32F103RB"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "Reflow_Oven",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/Reflow_Oven",
+      "status": "ok",
+      "sha256": "be996b5bba1a7381d2867fedacc7df52fa55819817560a10ae7ac951e8676346",
+      "bytes": 818192,
+      "machine": 40,
+      "entry_raw": "0x08001be9",
+      "flash_base": "0x08000000",
+      "ram_base": "0x08007944",
+      "vector_table_base": "0x08000000",
+      "vector_initial_sp": "0x20005000",
+      "vector_reset": "0x08001be8",
+      "function_symbols": 390,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "stm32f1",
+        "expected": "stm32f1",
+        "scores": {
+          "stm32f4": 10,
+          "stm32f1": 29,
+          "sam3x": 0,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "NUCLEO-F103RB",
+        "mcu": "STM32F103RB"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "Robot",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/Robot",
+      "status": "ok",
+      "sha256": "724ea82d567b9eefb23e6d75cc90ac0ccdbcd0c7aeca0cca964de46ec188f547",
+      "bytes": 984816,
+      "machine": 40,
+      "entry_raw": "0x080057e9",
+      "flash_base": "0x08000000",
+      "ram_base": "0x0800a198",
+      "vector_table_base": "0x08000000",
+      "vector_initial_sp": "0x20005000",
+      "vector_reset": "0x080057e8",
+      "function_symbols": 272,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "stm32f1",
+        "expected": "stm32f1",
+        "scores": {
+          "stm32f4": 0,
+          "stm32f1": 17,
+          "sam3x": 0,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "NUCLEO-F103RB",
+        "mcu": "STM32F103RB"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "Drone",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/Drone",
+      "status": "ok",
+      "sha256": "8cd6a8437713e3e4e0c8c2145b7b72a37143cdfec8753a5400a2d9a879b49c21",
+      "bytes": 435660,
+      "machine": 40,
+      "entry_raw": "0x08004f69",
+      "flash_base": "0x08000000",
+      "ram_base": "0x08007440",
+      "vector_table_base": "0x08000000",
+      "vector_initial_sp": "0x20005000",
+      "vector_reset": "0x08004f68",
+      "function_symbols": 287,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "stm32f1",
+        "expected": "stm32f1",
+        "scores": {
+          "stm32f4": 0,
+          "stm32f1": 22,
+          "sam3x": 0,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "NUCLEO-F103RB",
+        "mcu": "STM32F103RB"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "Console",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/Console",
+      "status": "ok",
+      "sha256": "216bbd526c7079bec496e97ab5bb4e6084819703a3de62dc946b124358e25a67",
+      "bytes": 1205684,
+      "machine": 40,
+      "entry_raw": "0x0000099d",
+      "flash_base": "0x00000000",
+      "ram_base": "0x00000000",
+      "vector_table_base": "0x00000000",
+      "vector_initial_sp": "0x1fff0200",
+      "vector_reset": "0x0000099c",
+      "function_symbols": 412,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "k64",
+        "expected": "k64",
+        "scores": {
+          "stm32f4": 0,
+          "stm32f1": 0,
+          "sam3x": 0,
+          "k64": 5
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "FRDM-K64F",
+        "mcu": "MK64FN1M0VLL12"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "Heat_Press",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/Heat_Press",
+      "status": "ok",
+      "sha256": "c4ad1641099388ece8398120d533f24fb15b7ed8a364a081e9f29842ccc9b815",
+      "bytes": 259198,
+      "machine": 40,
+      "entry_raw": "0x00080f25",
+      "flash_base": "0x00080000",
+      "ram_base": "0x20070000",
+      "vector_table_base": "0x00080000",
+      "vector_initial_sp": "0x20088000",
+      "vector_reset": "0x00080f24",
+      "function_symbols": 249,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "sam3x",
+        "expected": "sam3x",
+        "scores": {
+          "stm32f4": 0,
+          "stm32f1": 0,
+          "sam3x": 91,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "Arduino-Due",
+        "mcu": "SAM3X8E"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "Steering_Control",
+      "source_kind": "p2im-real_firmware/binary",
+      "path": "${P2IM_ROOT}/externals/p2im-real_firmware/binary/Steering_Control",
+      "status": "ok",
+      "sha256": "917cf289ecb231e9f2d0393494e7b6732625ed4303b2066e24859729a08697cc",
+      "bytes": 276943,
+      "machine": 40,
+      "entry_raw": "0x00080c21",
+      "flash_base": "0x00080000",
+      "ram_base": "0x20070000",
+      "vector_table_base": "0x00080000",
+      "vector_initial_sp": "0x20088000",
+      "vector_reset": "0x00080c20",
+      "function_symbols": 247,
+      "afl_call": {
+        "svc_0x3f_count": 1,
+        "present": true
+      },
+      "family": {
+        "inferred": "sam3x",
+        "expected": "sam3x",
+        "scores": {
+          "stm32f4": 0,
+          "stm32f1": 0,
+          "sam3x": 91,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "Arduino-Due",
+        "mcu": "SAM3X8E"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none"
+    },
+    {
+      "target": "Soldering_Iron",
+      "source_kind": "unpatched-est-data-set",
+      "path": "${HOEDUR_EXPERIMENTS_ROOT}/targets/arm/unpatched-est-data-set/P2IM/Soldering_Iron/Soldering_Iron.elf",
+      "status": "ok",
+      "sha256": "44a6f0e31a6187a6e4f53032390157cfbba3a2ff68c4a7ea2fd83baf22e9a519",
+      "bytes": 500996,
+      "machine": 40,
+      "entry_raw": "0x08000269",
+      "flash_base": "0x08000000",
+      "ram_base": "0x080100a0",
+      "vector_table_base": "0x08000000",
+      "vector_initial_sp": "0x20005000",
+      "vector_reset": "0x08000268",
+      "function_symbols": 407,
+      "afl_call": {
+        "svc_0x3f_count": 0,
+        "present": false
+      },
+      "family": {
+        "inferred": "stm32f1",
+        "expected": "stm32f1",
+        "scores": {
+          "stm32f4": 3,
+          "stm32f1": 28,
+          "sam3x": 0,
+          "k64": 0
+        },
+        "matches": true
+      },
+      "board": {
+        "qemu_board": "NUCLEO-F103RB",
+        "mcu": "STM32F103RB"
+      },
+      "p2im_runnable": true,
+      "instruction_authority": "none",
+      "auto_forkserver_pc": "0x08000268",
+      "runnable_note": "The unpatched ELF has no svc 0x3f. The rebuilt QEMU calls startForkserver once when a translation block covers 0x08000268 and P2IM_AUTO_FORKSERVER_PC is set. Image bytes stay unchanged."
+    }
+  ],
+  "instruction_authority": "none"
+}

@@ -1,0 +1,618 @@
+diff --git a/configure b/configure
+index 0759719..84f228a 100644
+--- a/configure
++++ b/configure
+@@ -1213,9 +1213,8 @@ fi
+ 
+ # Note that if the Python conditional here evaluates True we will exit
+ # with status 1 which is a shell 'false' value.
+-if ! $python -c 'import sys; sys.exit(sys.version_info < (2,4) or sys.version_info >= (3,))'; then
++if ! $python -c 'import sys; sys.exit(sys.version_info < (2,4))'; then
+   error_exit "Cannot use '$python', Python 2.4 or later is required." \
+-      "Note that Python 3 or later is not yet supported." \
+       "Use --python=/path/to/python to specify a supported Python."
+ fi
+ 
+diff --git a/cpu-exec.c b/cpu-exec.c
+index d68cc06..3125219 100644
+--- a/cpu-exec.c
++++ b/cpu-exec.c
+@@ -649,6 +649,11 @@ int cpu_exec(CPUArchState *env)
+                     }
+ 
+                     /* execute the generated code */
++                    /* Opt-in: P2IM_AUTO_FORKSERVER_PC. No-op unless the env var is set. */
++                    {
++                        extern void p2im_maybe_auto_forkserver(CPUArchState *env, target_ulong pc, target_ulong size);
++                        p2im_maybe_auto_forkserver(env, tb->pc, tb->size);
++                    }
+                     next_tb = cpu_tb_exec(tb->pc, cpu, tc_ptr, tb->size);
+                     switch (next_tb & TB_EXIT_MASK) {
+                     case TB_EXIT_REQUESTED:
+diff --git a/cputlb.c b/cputlb.c
+index a506086..75457bf 100644
+--- a/cputlb.c
++++ b/cputlb.c
+@@ -358,7 +358,10 @@ tb_page_addr_t get_page_addr_code(CPUArchState *env1, target_ulong addr)
+     mmu_idx = cpu_mmu_index(env1);
+     if (unlikely(env1->tlb_table[mmu_idx][page_index].addr_code !=
+                  (addr & TARGET_PAGE_MASK))) {
++        extern int pm_fetching_code;
++        pm_fetching_code = 1;
+         cpu_ldub_code(env1, addr);
++        pm_fetching_code = 0;
+     }
+     pd = env1->iotlb[mmu_idx][page_index].addr & ~TARGET_PAGE_MASK;
+     mr = iotlb_to_region(cpu, pd);
+@@ -373,7 +376,32 @@ tb_page_addr_t get_page_addr_code(CPUArchState *env1, target_ulong addr)
+         }
+     }
+     p = (void *)((uintptr_t)addr + env1->tlb_table[mmu_idx][page_index].addend);
+-    return qemu_ram_addr_from_host_nofail(p);
++    {
++        ram_addr_t ram_addr;
++
++        if (qemu_ram_addr_from_host(p, &ram_addr) == NULL) {
++            /* One line before abort. addr is the guest fetch that produced
++             * the null host pointer. ARM registers are the CPU state at the
++             * fetch, so a blx target shows up in addr and often in r3. */
++#ifdef TARGET_ARM
++            fprintf(stderr,
++                "Bad ram pointer %p guest_code_fetch addr=0x" TARGET_FMT_lx
++                " pc=0x%x r0=0x%x r3=0x%x addend=0x%lx\n",
++                p, addr, env1->regs[15], env1->regs[0], env1->regs[3],
++                (unsigned long)env1->tlb_table[mmu_idx][page_index].addend);
++#else
++            fprintf(stderr,
++                "Bad ram pointer %p guest_code_fetch addr=0x" TARGET_FMT_lx "\n",
++                p, addr);
++#endif
++            /* 0x72 is PM_EXEC_PERI. exit avoids pulling peri-mod.h into this file. */
++            if (addr >= 0x40000000 && addr < 0x60000000) {
++                exit(0x72);
++            }
++            abort();
++        }
++        return ram_addr;
++    }
+ }
+ 
+ #define MMUSUFFIX _mmu
+diff --git a/hw/arm/cortexm-helper.c b/hw/arm/cortexm-helper.c
+index c4c2c3a..ca14428 100644
+--- a/hw/arm/cortexm-helper.c
++++ b/hw/arm/cortexm-helper.c
+@@ -55,6 +55,7 @@ void cm_board_greeting(MachineState *machine)
+ 
+ /* ------------------------------------------------------------------------- */
+ 
++#if defined(CONFIG_SDL)
+ static QEMUTimer *timer;
+ 
+ /**
+@@ -75,6 +76,7 @@ static void sdl_event_loop(void *p)
+ 
+     timer_mod(timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
+ }
++#endif
+ 
+ /**
+  * Initialise SDL and display the board image.
+diff --git a/hw/display/gpio-led.c b/hw/display/gpio-led.c
+index 55362ca..409bd62 100644
+--- a/hw/display/gpio-led.c
++++ b/hw/display/gpio-led.c
+@@ -86,6 +86,7 @@ Object **gpio_led_create_from_info(Object *parent, GPIOLEDInfo *info_array,
+             gpio_led_connect(led, info->gpio_path, info->port_bit);
+         }
+ 
++#if defined(CONFIG_SDL)
+         if (info->w && info->h) {
+             /* Compute corner coordinate from centre coordinate. */
+             cm_object_property_set_int(led, info->x - (info->w / 2), "x");
+@@ -121,6 +122,7 @@ Object **gpio_led_create_from_info(Object *parent, GPIOLEDInfo *info_array,
+         }
+ 
+         GPIO_LED_STATE(led)->board_surface = (SDL_Surface *) board_surface;
++#endif
+ 
+         cm_object_realize(led);
+ 
+@@ -265,6 +267,7 @@ static void gpio_led_instance_init_callback(Object *obj)
+      */
+ }
+ 
++#if defined(CONFIG_SDL)
+ static SDL_Surface* crop_surface(SDL_Surface* sprite_sheet, SDL_Rect *rectangle)
+ {
+     SDL_Surface* surface = SDL_CreateRGBSurface(sprite_sheet->flags,
+@@ -274,11 +277,13 @@ static SDL_Surface* crop_surface(SDL_Surface* sprite_sheet, SDL_Rect *rectangle)
+     SDL_BlitSurface(sprite_sheet, rectangle, surface, 0);
+     return surface;
+ }
++#endif
+ 
+ static void gpio_led_realize_callback(DeviceState *dev, Error **errp)
+ {
+     qemu_log_function_name();
+ 
++#if defined(CONFIG_SDL)
+     GPIOLEDState *state = GPIO_LED_STATE(dev);
+ 
+     if (state->board_surface) {
+@@ -290,6 +295,7 @@ static void gpio_led_realize_callback(DeviceState *dev, Error **errp)
+                 state->colour.green, state->colour.blue);
+         SDL_FillRect(state->crop_on, NULL, colour);
+     }
++#endif
+ }
+ 
+ static void gpio_led_class_init_callback(ObjectClass *klass, void *data)
+diff --git a/include/afl/afl-qemu-cpu-inl.h b/include/afl/afl-qemu-cpu-inl.h
+index 737ac33..cc100ad 100644
+--- a/include/afl/afl-qemu-cpu-inl.h
++++ b/include/afl/afl-qemu-cpu-inl.h
+@@ -235,6 +235,8 @@ void afl_forkserver(CPUArchState *env) {
+ 
+     if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
+ 
++    /* PM_EXEC_PERI (0x72) is an execute of a peripheral address. Do not
++     * start model extraction for it. */
+     if (WIFEXITED(status) && (WEXITSTATUS(status) == PM_UNCAT_REG || 
+         WEXITSTATUS(status) == PM_UNMOD_SRRS)) {
+         // Fuzzer run terminated by access to unmodeled peripheral
+diff --git a/include/peri-mod/peri-mod.h b/include/peri-mod/peri-mod.h
+index e8734c1..a0e7d94 100644
+--- a/include/peri-mod/peri-mod.h
++++ b/include/peri-mod/peri-mod.h
+@@ -201,6 +201,9 @@ extern int CR_SR_r_idx_in_bbl; // 1-started index, 0 if not used
+ extern const char *aflFile;
+ #define PM_UNCAT_REG 0x40
+ #define PM_UNMOD_SRRS 0x41
++/* Guest tried to execute a peripheral address. Not a modelable register
++ * access, and not a host abort. AFL must not start model extraction. */
++#define PM_EXEC_PERI 0x72
+ #define PM_ME_EXIT 0x50
+ extern const char *me_bin;
+ extern const char *me_config;
+diff --git a/memory.c b/memory.c
+index 90a3fc2..a2d303d 100644
+--- a/memory.c
++++ b/memory.c
+@@ -1159,6 +1159,8 @@ volatile int SR_cat_by_fixup = 0;
+ int handle_hybrid_SR_way = 0;
+ int CR_SR_r_idx_in_bbl = 0;
+ 
++int pm_fetching_code;
++
+ static uint64_t unassigned_mem_read(void *opaque, hwaddr addr,
+                                     unsigned size)
+ {
+@@ -1179,6 +1181,10 @@ static uint64_t unassigned_mem_read(void *opaque, hwaddr addr,
+ 
+     cnt ++;
+     if(pm_ena && (addr >= 0x40000000 && addr < 0x60000000)) {
++        /* Instruction fetch of a smashed callback or other peripheral
++         * address. Do not create a peripheral or ask for model extraction. */
++        if (pm_fetching_code)
++            return 0;
+         // TODO peripheral region. Need to include internal peri
+ 
+         pm_cnt ++;
+diff --git a/scripts/ordereddict.py b/scripts/ordereddict.py
+index 7242b50..6dd9ab0 100644
+--- a/scripts/ordereddict.py
++++ b/scripts/ordereddict.py
+@@ -20,9 +20,14 @@
+ #     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ #     OTHER DEALINGS IN THE SOFTWARE.
+ 
+-from UserDict import DictMixin
+-
+-class OrderedDict(dict, DictMixin):
++import sys
++if sys.version_info[0] >= 3:
++    from collections import OrderedDict
++else:
++    from UserDict import DictMixin
++
++if sys.version_info[0] < 3:
++ class OrderedDict(dict, DictMixin):
+ 
+     def __init__(self, *args, **kwds):
+         if len(args) > 1:
+diff --git a/scripts/qapi-commands.py b/scripts/qapi-commands.py
+index ca22acc..4bd30d7 100644
+--- a/scripts/qapi-commands.py
++++ b/scripts/qapi-commands.py
+@@ -290,8 +290,8 @@ for o, a in opts:
+         middle_mode = True
+ 
+ exprs = parse_schema(input_file)
+-commands = filter(lambda expr: expr.has_key('command'), exprs)
+-commands = filter(lambda expr: not expr.has_key('gen'), commands)
++commands = list(filter(lambda expr: ('command' in expr), exprs))
++commands = list(filter(lambda expr: not ('gen' in expr), commands))
+ 
+ c_comment = '''
+ /*
+@@ -353,9 +353,9 @@ fdecl.write(mcgen('''
+ for cmd in commands:
+     arglist = []
+     ret_type = None
+-    if cmd.has_key('data'):
++    if ('data' in cmd):
+         arglist = cmd['data']
+-    if cmd.has_key('returns'):
++    if ('returns' in cmd):
+         ret_type = cmd['returns']
+     ret = generate_command_decl(cmd['command'], arglist, ret_type) + "\n"
+     fdecl.write(ret)
+diff --git a/scripts/qapi-event.py b/scripts/qapi-event.py
+index 56bc602..35e78a5 100644
+--- a/scripts/qapi-event.py
++++ b/scripts/qapi-event.py
+@@ -272,7 +272,7 @@ event_enum_values = []
+ event_enum_strings = []
+ 
+ for expr in exprs:
+-    if expr.has_key('event'):
++    if ('event' in expr):
+         event_name = expr['event']
+         params = expr.get('data')
+         if params and len(params) == 0:
+diff --git a/scripts/qapi-types.py b/scripts/qapi-types.py
+index e6eb4b6..7d2bc22 100644
+--- a/scripts/qapi-types.py
++++ b/scripts/qapi-types.py
+@@ -126,6 +126,7 @@ const char * const %(name)s_lookup[] = {
+     return ret
+ 
+ def generate_enum(name, values):
++    values = list(values)
+     name = c_name(name)
+     lookup_decl = mcgen('''
+ extern const char * const %(name)s_lookup[];
+@@ -333,20 +334,20 @@ fdecl.write(guardend("QAPI_TYPES_BUILTIN_STRUCT_DECL"))
+ 
+ for expr in exprs:
+     ret = "\n"
+-    if expr.has_key('struct'):
++    if ('struct' in expr):
+         ret += generate_fwd_struct(expr['struct'])
+-    elif expr.has_key('enum'):
++    elif ('enum' in expr):
+         ret += generate_enum(expr['enum'], expr['data']) + "\n"
+         ret += generate_fwd_enum_struct(expr['enum'])
+         fdef.write(generate_enum_lookup(expr['enum'], expr['data']))
+-    elif expr.has_key('union'):
++    elif ('union' in expr):
+         ret += generate_fwd_struct(expr['union']) + "\n"
+         enum_define = discriminator_find_enum_define(expr)
+         if not enum_define:
+             ret += generate_enum('%sKind' % expr['union'], expr['data'].keys())
+             fdef.write(generate_enum_lookup('%sKind' % expr['union'],
+                                             expr['data'].keys()))
+-    elif expr.has_key('alternate'):
++    elif ('alternate' in expr):
+         ret += generate_fwd_struct(expr['alternate']) + "\n"
+         ret += generate_enum('%sKind' % expr['alternate'], expr['data'].keys())
+         fdef.write(generate_enum_lookup('%sKind' % expr['alternate'],
+@@ -374,25 +375,25 @@ if do_builtins:
+ 
+ for expr in exprs:
+     ret = "\n"
+-    if expr.has_key('struct'):
++    if ('struct' in expr):
+         ret += generate_struct(expr) + "\n"
+         ret += generate_type_cleanup_decl(expr['struct'] + "List")
+         fdef.write(generate_type_cleanup(expr['struct'] + "List") + "\n")
+         ret += generate_type_cleanup_decl(expr['struct'])
+         fdef.write(generate_type_cleanup(expr['struct']) + "\n")
+-    elif expr.has_key('union'):
++    elif ('union' in expr):
+         ret += generate_union(expr, 'union')
+         ret += generate_type_cleanup_decl(expr['union'] + "List")
+         fdef.write(generate_type_cleanup(expr['union'] + "List") + "\n")
+         ret += generate_type_cleanup_decl(expr['union'])
+         fdef.write(generate_type_cleanup(expr['union']) + "\n")
+-    elif expr.has_key('alternate'):
++    elif ('alternate' in expr):
+         ret += generate_union(expr, 'alternate')
+         ret += generate_type_cleanup_decl(expr['alternate'] + "List")
+         fdef.write(generate_type_cleanup(expr['alternate'] + "List") + "\n")
+         ret += generate_type_cleanup_decl(expr['alternate'])
+         fdef.write(generate_type_cleanup(expr['alternate']) + "\n")
+-    elif expr.has_key('enum'):
++    elif ('enum' in expr):
+         ret += generate_type_cleanup_decl(expr['enum'] + "List")
+         fdef.write(generate_type_cleanup(expr['enum'] + "List") + "\n")
+     else:
+diff --git a/scripts/qapi-visit.py b/scripts/qapi-visit.py
+index 5b99336..ee90bbe 100644
+--- a/scripts/qapi-visit.py
++++ b/scripts/qapi-visit.py
+@@ -444,14 +444,14 @@ if do_builtins:
+         fdef.write(generate_visit_list(typename, None))
+ 
+ for expr in exprs:
+-    if expr.has_key('struct'):
++    if ('struct' in expr):
+         ret = generate_visit_struct(expr)
+         ret += generate_visit_list(expr['struct'], expr['data'])
+         fdef.write(ret)
+ 
+         ret = generate_declaration(expr['struct'], expr['data'])
+         fdecl.write(ret)
+-    elif expr.has_key('union'):
++    elif ('union' in expr):
+         ret = generate_visit_union(expr)
+         ret += generate_visit_list(expr['union'], expr['data'])
+         fdef.write(ret)
+@@ -463,7 +463,7 @@ for expr in exprs:
+                                      expr['data'].keys())
+         ret += generate_declaration(expr['union'], expr['data'])
+         fdecl.write(ret)
+-    elif expr.has_key('alternate'):
++    elif ('alternate' in expr):
+         ret = generate_visit_alternate(expr['alternate'], expr['data'])
+         ret += generate_visit_list(expr['alternate'], expr['data'])
+         fdef.write(ret)
+@@ -472,7 +472,7 @@ for expr in exprs:
+                                  expr['data'].keys())
+         ret += generate_declaration(expr['alternate'], expr['data'])
+         fdecl.write(ret)
+-    elif expr.has_key('enum'):
++    elif ('enum' in expr):
+         ret = generate_visit_list(expr['enum'], expr['data'])
+         ret += generate_visit_enum(expr['enum'], expr['data'])
+         fdef.write(ret)
+diff --git a/scripts/qapi.py b/scripts/qapi.py
+index 06d7fc2..0145d28 100644
+--- a/scripts/qapi.py
++++ b/scripts/qapi.py
+@@ -146,7 +146,7 @@ class QAPISchema:
+                     continue
+                 try:
+                     fobj = open(incl_abs_fname, 'r')
+-                except IOError, e:
++                except IOError as e:
+                     raise QAPIExprError(expr_info,
+                                         '%s: %s' % (e.strerror, include))
+                 exprs_include = QAPISchema(fobj, previously_included,
+@@ -312,7 +312,7 @@ def find_base_fields(base):
+ 
+ # Return the qtype of an alternate branch, or None on error.
+ def find_alternate_member_qtype(qapi_type):
+-    if builtin_types.has_key(qapi_type):
++    if (qapi_type in builtin_types):
+         return builtin_types[qapi_type]
+     elif find_struct(qapi_type):
+         return "QTYPE_QDICT"
+@@ -491,7 +491,7 @@ def check_member_clash(expr_info, base_name, data, source = ""):
+ 
+ def check_command(expr, expr_info):
+     name = expr['command']
+-    allow_star = expr.has_key('gen')
++    allow_star = ('gen' in expr)
+ 
+     check_type(expr_info, "'data' for command '%s'" % name,
+                expr.get('data'), allow_dict=True, allow_optional=True,
+@@ -683,7 +683,7 @@ def check_keys(expr_elem, meta, required, optional=[]):
+                                 "'%s' of %s '%s' should only use false value"
+                                 % (key, meta, name))
+     for key in required:
+-        if not expr.has_key(key):
++        if not (key in expr):
+             raise QAPIExprError(info,
+                                 "Key '%s' is missing from %s '%s'"
+                                 % (key, meta, name))
+@@ -697,24 +697,24 @@ def check_exprs(exprs):
+     for expr_elem in exprs:
+         expr = expr_elem['expr']
+         info = expr_elem['info']
+-        if expr.has_key('enum'):
++        if ('enum' in expr):
+             check_keys(expr_elem, 'enum', ['data'])
+             add_enum(expr['enum'], info, expr['data'])
+-        elif expr.has_key('union'):
++        elif ('union' in expr):
+             check_keys(expr_elem, 'union', ['data'],
+                        ['base', 'discriminator'])
+             add_union(expr, info)
+-        elif expr.has_key('alternate'):
++        elif ('alternate' in expr):
+             check_keys(expr_elem, 'alternate', ['data'])
+             add_name(expr['alternate'], info, 'alternate')
+-        elif expr.has_key('struct'):
++        elif ('struct' in expr):
+             check_keys(expr_elem, 'struct', ['data'], ['base'])
+             add_struct(expr, info)
+-        elif expr.has_key('command'):
++        elif ('command' in expr):
+             check_keys(expr_elem, 'command', [],
+                        ['data', 'returns', 'gen', 'success-response'])
+             add_name(expr['command'], info, 'command')
+-        elif expr.has_key('event'):
++        elif ('event' in expr):
+             check_keys(expr_elem, 'event', [], ['data'])
+             add_name(expr['event'], info, 'event')
+         else:
+@@ -724,11 +724,11 @@ def check_exprs(exprs):
+     # Try again for hidden UnionKind enum
+     for expr_elem in exprs:
+         expr = expr_elem['expr']
+-        if expr.has_key('union'):
++        if ('union' in expr):
+             if not discriminator_find_enum_define(expr):
+                 add_enum('%sKind' % expr['union'], expr_elem['info'],
+                          implicit=True)
+-        elif expr.has_key('alternate'):
++        elif ('alternate' in expr):
+             add_enum('%sKind' % expr['alternate'], expr_elem['info'],
+                      implicit=True)
+ 
+@@ -737,29 +737,29 @@ def check_exprs(exprs):
+         expr = expr_elem['expr']
+         info = expr_elem['info']
+ 
+-        if expr.has_key('enum'):
++        if ('enum' in expr):
+             check_enum(expr, info)
+-        elif expr.has_key('union'):
++        elif ('union' in expr):
+             check_union(expr, info)
+-        elif expr.has_key('alternate'):
++        elif ('alternate' in expr):
+             check_alternate(expr, info)
+-        elif expr.has_key('struct'):
++        elif ('struct' in expr):
+             check_struct(expr, info)
+-        elif expr.has_key('command'):
++        elif ('command' in expr):
+             check_command(expr, info)
+-        elif expr.has_key('event'):
++        elif ('event' in expr):
+             check_event(expr, info)
+         else:
+             assert False, 'unexpected meta type'
+ 
+-    return map(lambda expr_elem: expr_elem['expr'], exprs)
++    return list(map(lambda expr_elem: expr_elem['expr'], exprs))
+ 
+ def parse_schema(fname):
+     try:
+         schema = QAPISchema(open(fname, "r"))
+         return check_exprs(schema.exprs)
+-    except (QAPISchemaError, QAPIExprError), e:
+-        print >>sys.stderr, e
++    except (QAPISchemaError, QAPIExprError) as e:
++        print(e, file=sys.stderr)
+         exit(1)
+ 
+ #
+@@ -821,7 +821,7 @@ def camel_to_upper(value):
+ def c_enum_const(type_name, const_name):
+     return camel_to_upper(type_name + '_' + const_name)
+ 
+-c_name_trans = string.maketrans('.-', '__')
++c_name_trans = str.maketrans('.-', '__')
+ 
+ # Map @name to a valid C identifier.
+ # If @protect, avoid returning certain ticklish identifiers (like
+@@ -946,7 +946,7 @@ def pop_indent(indent_amount=4):
+ def cgen(code, **kwds):
+     indent = genindent(indent_level)
+     lines = code.split('\n')
+-    lines = map(lambda x: indent + x, lines)
++    lines = list(map(lambda x: indent + x, lines))
+     return '\n'.join(lines) % kwds + '\n'
+ 
+ def mcgen(code, **kwds):
+@@ -990,8 +990,8 @@ def parse_command_line(extra_options = "", extra_long_options = []):
+                                        "chp:o:" + extra_options,
+                                        ["source", "header", "prefix=",
+                                         "output-dir="] + extra_long_options)
+-    except getopt.GetoptError, err:
+-        print >>sys.stderr, "%s: %s" % (sys.argv[0], str(err))
++    except getopt.GetoptError as err:
++        print("%s: %s" % (sys.argv[0], str(err)), file=sys.stderr)
+         sys.exit(1)
+ 
+     output_dir = ""
+@@ -1018,7 +1018,7 @@ def parse_command_line(extra_options = "", extra_long_options = []):
+         do_h = True
+ 
+     if len(args) != 1:
+-        print >>sys.stderr, "%s: need exactly one argument" % sys.argv[0]
++        print("%s: need exactly one argument" % sys.argv[0], file=sys.stderr)
+         sys.exit(1)
+     fname = args[0]
+ 
+@@ -1035,7 +1035,7 @@ def open_output(output_dir, do_c, do_h, prefix, c_file, h_file,
+ 
+     try:
+         os.makedirs(output_dir)
+-    except os.error, e:
++    except os.error as e:
+         if e.errno != errno.EEXIST:
+             raise
+ 
+@@ -1043,8 +1043,8 @@ def open_output(output_dir, do_c, do_h, prefix, c_file, h_file,
+         if really:
+             return open(name, opt)
+         else:
+-            import StringIO
+-            return StringIO.StringIO()
++            import io
++            return io.StringIO()
+ 
+     fdef = maybe_open(do_c, c_file, 'w')
+     fdecl = maybe_open(do_h, h_file, 'w')
+diff --git a/scripts/tracetool.py b/scripts/tracetool.py
+index 83bde7b..7b82959 100644
+--- a/scripts/tracetool.py
++++ b/scripts/tracetool.py
+@@ -71,7 +71,7 @@ def main(args):
+ 
+     try:
+         opts, args = getopt.getopt(args[1:], "", long_opts)
+-    except getopt.GetoptError, err:
++    except getopt.GetoptError as err:
+         error_opt(str(err))
+ 
+     check_backends = False
+@@ -132,7 +132,7 @@ def main(args):
+     try:
+         tracetool.generate(sys.stdin, arg_format, arg_backends,
+                            binary=binary, probe_prefix=probe_prefix)
+-    except tracetool.TracetoolError, e:
++    except tracetool.TracetoolError as e:
+         error_opt(str(e))
+ 
+ if __name__ == "__main__":
+diff --git a/target-arm/translate.c b/target-arm/translate.c
+index 7002a3f..d008035 100644
+--- a/target-arm/translate.c
++++ b/target-arm/translate.c
+@@ -11652,6 +11652,40 @@ static target_ulong startForkserver(CPUArchState *env, target_ulong enableTicks)
+     return 0;
+ }
+ 
++/*
++ * Firmwares without an svc 0x3f aflCall never enter startForkserver, so aflStart stays 0
++ * and AFL's fork server never runs. P2IM_AUTO_FORKSERVER_PC is an opt-in Thumb address
++ * (the reset handler or main). The first translated block that covers it calls
++ * startForkserver once. Unset, this is a no-op and does not change images that already
++ * execute svc 0x3f.
++ */
++void p2im_maybe_auto_forkserver(CPUArchState *env, target_ulong pc, target_ulong size)
++{
++    static int ready;
++    static int enabled;
++    static target_ulong want;
++
++    if (!ready) {
++        const char *text = getenv("P2IM_AUTO_FORKSERVER_PC");
++        char *end = NULL;
++        ready = 1;
++        if (text && text[0]) {
++            unsigned long value = strtoul(text, &end, 0);
++            if (end != text && value != 0) {
++                want = (target_ulong)value & ~(target_ulong)1;
++                enabled = 1;
++            }
++        }
++    }
++    if (!enabled || afl_startfs_invoked || afl_fork_child)
++        return;
++    if (size < 2)
++        size = 2;
++    if (want < pc || want >= pc + size)
++        return;
++    startForkserver(env, 0);
++}
++
+ int pm_ena = 0;
+ int pm_rand_i = 0;
+ int pm_rand_sz = 0;

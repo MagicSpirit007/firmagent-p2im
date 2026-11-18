@@ -1,0 +1,15 @@
+node_modules/
+dist/
+runs/
+work/
+deps/
+configs/m3/
+*.pyc
+__pycache__/
+.env
+.env.*
+auth.json
+*.credentials*
+*.tar.zst
+*.log
+.DS_Store

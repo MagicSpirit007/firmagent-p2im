@@ -1,0 +1,40 @@
+MIT License
+
+Copyright (c) 2026 FirmAgent-P2IM Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+Third-Party Notices
+================================================================================
+
+1. Upstream P2IM (`https://github.com/RiS3-Lab/p2im`, including AFL and
+   `model_instantiation/` Python orchestration scripts) is licensed under the
+   Apache License, Version 2.0. The file `patches/p2im-python312-scripts.patch`
+   modifies files from `RiS3-Lab/p2im` under Apache-2.0.
+
+2. Upstream GNU ARM Eclipse QEMU (`qemu/src/qemu.git` inside `RiS3-Lab/p2im`) is
+   licensed under the GNU General Public License, Version 2 only (GPL-2.0-only).
+   The file `patches/p2im-qemu-auto-forkserver.patch` is distributed for
+   patching that QEMU tree under GPL-2.0-only.
+
+3. Upstream Hoedur benchmark targets and binary-patching ground-truth notes
+   (`https://github.com/fuzzware-fuzzer/hoedur-experiments`) remain subject to
+   their respective upstream repository licenses and are fetched separately via
+   `scripts/setup_upstreams.sh` rather than redistributed inside this repository.

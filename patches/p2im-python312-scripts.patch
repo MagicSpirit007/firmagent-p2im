@@ -1,0 +1,109 @@
+diff --git a/cov.py b/cov.py
+index 7ce8a09..bf679cf 100644
+--- a/cov.py
++++ b/cov.py
+@@ -38,7 +38,7 @@ def color_print(s, color="green"):
+ def read_config(cfg_f):
+     if not os.path.isfile(cfg_f):
+         sys.exit("Cannot find the specified configuration file: %s" % cfg_f)
+-    parser = configparser.SafeConfigParser()
++    parser = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
+     parser.read(cfg_f)
+ 
+     return Namespace(
+diff --git a/fuzz.py b/fuzz.py
+index f28a035..44f694b 100644
+--- a/fuzz.py
++++ b/fuzz.py
+@@ -20,6 +20,8 @@ import configparser
+ import argparse
+ from argparse import Namespace
+ 
++from wsl_compat import apply_wsl_compat
++
+ def color_print(s, color="green"):
+     if color == "green":
+         print("\033[92m%s\033[0m" % s)
+@@ -35,7 +37,7 @@ def color_print(s, color="green"):
+ def read_config(cfg_f):
+     if not os.path.isfile(cfg_f):
+         sys.exit("Cannot find the specified configuration file: %s" % cfg_f)
+-    parser = configparser.SafeConfigParser()
++    parser = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
+     parser.read(cfg_f)
+ 
+     return Namespace(
+@@ -75,6 +77,7 @@ if __name__ == "__main__":
+ 
+     args = parser.parse_args()
+     #print args
++    apply_wsl_compat()
+ 
+     if args.config:
+       args.config = os.path.abspath(args.config)
+diff --git a/me.py b/me.py
+index e08a21f..2754798 100644
+--- a/me.py
++++ b/me.py
+@@ -21,6 +21,8 @@ import configparser
+ import argparse
+ from argparse import Namespace
+ 
++from wsl_compat import apply_wsl_compat
++
+ 
+ def cmp(a, b):
+     r = 0 if a.__eq__(b) else 1
+@@ -41,7 +43,7 @@ def color_print(s, color="green"):
+ def read_config(cfg_f):
+     if not os.path.isfile(cfg_f):
+         sys.exit("Cannot find the specified configuration file: %s" % cfg_f)
+-    parser = configparser.SafeConfigParser()
++    parser = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
+     parser.read(cfg_f)
+ 
+     return Namespace(
+@@ -173,20 +175,28 @@ def qemu_run(cmd, retry_num, stage):
+     rv = {1: [0x20, 0x19, 0x30], 2: [0x21, 0x23],
+           1.1: [0x20, 0x30]}
+     error_rv = {2: {0x24: "Cannot find SR Model which is supposed to exist"}}
++    # 0x72: guest executed a peripheral address. Repeating the same QEMU
++    # command will not categorize a register.
++    no_retry = {0x72}
+ 
+     run_num = 0
+     while run_num < retry_num:
+-        with open(os.devnull, 'w') as devnull:
++        with open(os.devnull, 'w') as devnull, open("qemu-stderr.txt", "ab") as errf:
+             # TODO may need timeout
+-            ret_val = subprocess.call(cmd, stdout=devnull, stderr=devnull)
+-        print("ret_val: 0x%x" % ret_val)
+-        if ret_val in rv[stage]:
++            ret_val = subprocess.call(cmd, stdout=devnull, stderr=errf)
++        print("ret_val: 0x%x" % (ret_val & 0xffffffff))
++        if ret_val in rv.get(stage, []):
+             return ret_val
+-        color_print("ret_val == 0x%x, re-run it!" % ret_val, "red")
++        if ret_val < 0 or ret_val in no_retry:
++            break
++        color_print("ret_val == 0x%x, re-run it!" % (ret_val & 0xffffffff), "red")
+         run_num += 1
+ 
+-    color_print(error_rv[stage][ret_val], "red")
+-    sys.exit("Stage %d returned due to unexpected reasons!" % stage)
++    msg = error_rv.get(stage, {}).get(ret_val)
++    if msg is None:
++        msg = "stage %s ended with 0x%x" % (stage, ret_val & 0xffffffff)
++    color_print(msg, "red")
++    sys.exit("Stage %s returned due to unexpected reasons!" % stage)
+ 
+ def cnt_bbl_cov(trace_f):
+     bc = {}
+@@ -1040,6 +1050,7 @@ def stage2_5(srr_info, s2_dir, term_cond0, checked_bcs, trace_sig, inv_num=1):
+ 
+ 
+ if __name__ == "__main__":
++    apply_wsl_compat()
+     start_time = time.time()
+ 
+     parser = argparse.ArgumentParser(description="Model Extraction Tool")
