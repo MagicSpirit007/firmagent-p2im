@@ -22,6 +22,15 @@
    - Agent prompts, tool envelopes, and analysis slices are hard-asserted free of `CVE-`/`CWE-`/`Table 5` truth-set tokens (`assertNoLeak`).
    - Offline host scorer `score_l5.py` runs only after all Agent sessions terminate, splitting verified `L4` candidates into `known_p2im_bug_direct`, `known_p2im_bug_downstream` (upstream shared-SRAM corruption root cause), and `unmatched_verified_candidate`.
 
+### Why & What Changed: From Linux FirmAgent & Stock P2IM to Bare-Metal `firmagent-p2im`
+
+| Problem / Bottleneck | Mechanism Introduced (File / Symbol) | Observable Before -> After |
+|---|---|---|
+| Stock `RiS3-Lab/p2im` (`0e64506a`) fails on Ubuntu 24.04 / Python 3.12 (`SafeConfigParser` removed, 2017 `libglib` mismatch, `killall` missing, WSL2 AFL checks) | `patches/p2im-python312-scripts.patch` (`ConfigParser(inline_comment_prefixes=...)`), `p2im-shim/wsl_compat.py`, `unset LD_LIBRARY_PATH` QEMU shim, `<100B` path preflight (`tools/p2im_oracle.py`, `scripts/generate_configs.py`) | **Before**: Immediate import/link aborts or container dry-run rejections<br>**After**: Deterministic builds, `0`-stray process sweeps, verified offline tests (`24/24` with mounted truth/ELFs) |
+| Unpatched `Soldering_Iron.elf` (`44a6f0e3…`) has `0` `svc #0x3f` calls, so stock QEMU never starts AFL forkserver | Opt-in `p2im_maybe_auto_forkserver` gated by `P2IM_AUTO_FORKSERVER_PC=0x08000268` (`target-arm/translate.c`, `cpu-exec.c`); no-op when unset | **Before**: `0` models, `p2im_runnable=false` (9/10 targets)<br>**After**: Zero ELF edits; `Soldering_Iron` hits `start up afl forkserver!` (`13` peripherals, `33` DR, `60.066s` fuzz window) |
+| Corrupted callback pointers jumping into MMIO (`0x40000000..0x5fffffff`) trigger bogus unmodeled-peripheral retries (`0x40`); wrong `CNC` board or 256B `Reflow_Oven` dry-run aborts | `PM_EXEC_PERI = 0x72` guard + `pm_fetching_code` (`cputlb.c`, `memory.c`) + `no_retry`; lock `CNC` to `STM32F429I-Discovery`; dual `seed-short` (`0\n\x00\x00`) beside `seed-random` | **Before**: `me.py` retry loops; `CNC` `0` DR (`-11`); `Reflow_Oven` `0` execs `PROGRAM ABORT`<br>**After**: Clean `0x72` exit with register trace; `CNC` `39` DR (`2926` execs/60s); `Reflow_Oven` `2582` execs/60s |
+| ISR-to-main communication crosses global SRAM buffers (`slave` -> `rx_callback`) without a direct call edge; downstream callback crashes obscure upstream root causes | `DISASM_PARSER_VERSION = 3` (`add` mnemonic + literal pools), `indexed_member_sites` / `indexed_reach` (`call_edge: false`), `sharedViaRank` (`mcu-runtime.ts`), `admit-seed` CRC16 gate, offline `score_l5.py` (`## <Firmware>` fix) | **Before**: Missing `Modbus::process_FC1` upstream link (`L5 downstream=0`); `score_l5.py` ignored `## PLC`<br>**After**: `PLC` attributes downstream crash in `HAL_UART_RxCpltCallback` to `Modbus::process_FC1` (`L5 downstream=2` with `0` truth leakage) |
+
 ---
 
 ## Architecture / 运行架构
@@ -58,15 +67,29 @@ All 10 unpatched binaries are fetched from upstream public repositories and veri
 
 ---
 
-## 5-Step Quickstart (Ubuntu 22.04/24.04 or WSL2 Ubuntu 24.04)
+## Reproduction Routes / 复现路径（手工详尽分步 vs 一键等价封装）
 
-> **Important**: Run all commands on a **Linux native ext4 filesystem** with a short `work_root` such as `/tmp/fa-p2im` (required by P2IM AFL's `< 100`-byte `-c` path limit and to avoid NTFS/9p `fsync` issues on `/mnt/*`).
+> **Important**: Run all commands on a **Linux native ext4 filesystem** with a short `work_root` such as `/tmp/fa-p2im` (required by P2IM AFL's `< 100`-byte `-c` path limit and to avoid NTFS/9p `fsync` issues on `/mnt/*`). Also set `echo core | sudo tee /proc/sys/kernel/core_pattern` on Ubuntu/WSL2 hosts before AFL dry-runs.
+
+### Route A: Full Manual Step-by-Step Scientific Walkthrough (Recommended for Audits)
+
+To inspect every change and verify each component without black-box wrappers, follow **Steps 1–9** in [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md):
+- **Steps 1–2**: Install host packages (`psmisc`, `binutils-arm-none-eabi`, `libjansson-dev`, Node `>=22.19.0`), configure `/proc/sys/kernel/core_pattern`, check out pinned `RiS3-Lab/p2im@0e64506a`, `p2im-real_firmware@d4c74565`, and `hoedur-experiments@2babc78b`, verify all 10 ELF SHA256 digests, and compare `svc 0x3f` counts via `arm-none-eabi-objdump`.
+- **Steps 3–5**: Manually compile `afl-fuzz`, inspect (`git apply --stat`) and apply the 16-file QEMU patch, check the `CONFIG_STM32=y` / `CONFIG_KINETIS=n` invariant, build `qemu-system-gnuarmeclipse` with `-ljansson` & `nm` verification (`T p2im_maybe_auto_forkserver`), apply `p2im-python312-scripts.patch` + `wsl_compat.py` + `me` wrapper, and generate `configs/m3/*.json`.
+- **Step 6**: Build TypeScript (`npm ci && npm run build`), run TS/Python contract suites (`npm test`, `npm run test:py`), run `npm run verify:privacy`, and verify provider setup via read-only `node dist/src/cli.js doctor`.
+- **Step 7 (Low-Level Dissection)**: Drive `tools/p2im_oracle.py` manually command-by-command (`prepare` -> `smoke` -> `me` -> `fuzz` -> `extract-sources` -> `slice-paths` -> `admit-seed` negative/positive CRC16 examples -> `crashes` -> `replay --repeat 3` -> `contrast` -> optional `gdb-watch`), plus side-by-side manual verification of `Soldering_Iron` (`--auto-forkserver-pc 0x08000268`) and `Reflow_Oven` (`seed-short`).
+- **Steps 8–9**: Run controlled `--mode offline` (`model_calls=0`) vs `--mode real` (`DEEPSEEK_API_KEY`) campaigns, then evaluate offline isolated `score_l5.py` + `leak_check.py` under the three-arm (`B0` vs `offline` vs `real`) equal-wall-clock / equal-`execs_done` protocol.
+
+### Route B: 5-Step Automated Quickstart (`scripts/setup_upstreams.sh` Wrapper for Steps 1–5)
+
+`scripts/setup_upstreams.sh` automates Manual Route Steps 1–5 end-to-end:
 
 1. **Install OS prerequisites & Node.js >= 22.19.0**:
    ```bash
    sudo apt-get update && sudo apt-get install -y \
      build-essential git pkg-config python3 psmisc binutils-arm-none-eabi \
      libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libjansson-dev gdb-multiarch
+   echo core | sudo tee /proc/sys/kernel/core_pattern
    ```
 2. **Clone this repository on Linux native ext4, fetch pinned upstreams (`RiS3-Lab/p2im` + `hoedur-experiments`), compile AFL & patched QEMU, verify all 10 ELFs, and generate `configs/m3/*.json`**:
    ```bash
@@ -78,7 +101,7 @@ All 10 unpatched binaries are fetched from upstream public repositories and veri
    ```bash
    npm ci && npm run build
    npm test
-   npm run test:py
+   P2IM_ROOT="$HOME/deps/p2im" P2IM_NOTES="$HOME/deps/hoedur-experiments/02-coverage-est-data-set/binary-patching/P2IM_patching_notes.md" npm run test:py
    npm run verify:privacy
    ```
 4. **Run zero-LLM baseline (`B0` stock P2IM segment or `--mode offline` full `L1–L4` loop)**:
@@ -87,13 +110,14 @@ All 10 unpatched binaries are fetched from upstream public repositories and veri
      --elf "$HOME/deps/p2im/externals/p2im-real_firmware/binary/PLC" \
      --expect-sha256 783108cf8b9cf7f703a4164dfee7d12d9a9f79d663328a21454a70a7003c2b08 \
      --work-root /tmp/fa-p2im-b0
+   python3 tools/p2im_oracle.py me --target PLC --round 0 --work-root /tmp/fa-p2im-b0
    python3 tools/p2im_oracle.py fuzz --target PLC --segment s1 --seconds 60 --work-root /tmp/fa-p2im-b0
    # Or run full TypeScript offline pipeline (model_requests = 0):
    node dist/src/cli.js mcu-p2im --config configs/m3/plc.json --out runs/plc-offline --mode offline
    ```
 5. **Run with DeepSeek LLM + offline post-hoc `L5` scoring**:
    ```bash
-   export DEEPSEEK_API_KEY="<your-deepseek-api-key>"   # never commit or log keys
+   read -rsp "DEEPSEEK_API_KEY: " DEEPSEEK_API_KEY && export DEEPSEEK_API_KEY && echo
    node dist/src/cli.js doctor --provider deepseek --model deepseek-v4-flash
    node dist/src/cli.js mcu-p2im --config configs/m3/plc.json --out runs/plc-real --mode real \
      --provider deepseek --model deepseek-v4-flash --model-calls 16 --max-total-tokens 150000
@@ -103,9 +127,9 @@ All 10 unpatched binaries are fetched from upstream public repositories and veri
      --candidates runs/plc-real/l5-candidates.json --target PLC --summary-only --out runs/plc-real/l5.json
    ```
 
-For detailed step-by-step instructions, multi-seed evaluation protocols, troubleshooting, and artifact schemas, read:
-- **完整可复现实验手册 / Full Reproducibility Guide**: [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md)
-- **相对上游的全部修改清单 / Changelog from Upstream P2IM**: [`docs/CHANGELOG_FROM_UPSTREAM.md`](docs/CHANGELOG_FROM_UPSTREAM.md)
+For design rationales, Before/After evidence, multi-seed evaluation protocols, troubleshooting, and artifact schemas, read:
+- **科研理据与完整分步复现手册 / Design Rationale & Manual Reproducibility Guide**: [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md)
+- **相对上游的全部改动清单 / Changelog from Upstream P2IM**: [`docs/CHANGELOG_FROM_UPSTREAM.md`](docs/CHANGELOG_FROM_UPSTREAM.md)
 - **QEMU 重建说明 / QEMU Build Notes**: [`docs/BUILD_QEMU.md`](docs/BUILD_QEMU.md)
 
 ---
