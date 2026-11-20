@@ -33,6 +33,29 @@
 
 ---
 
+## Design Rationale & Technical Route / 设计理据与技术路线
+
+### 1. 为什么不直接在原版 `vul337/FirmAgent` 代码库上修改？
+
+1. **原版架构重度绑定 Linux Web 路由器且存在工程断点**：
+   - 原版 `vul337/FirmAgent`（`ea0dbdd`）从底层到上层强耦合于 **Greenhouse 容器重托管 + HTTP URI/参数网络 Fuzzer + IDA Pro Hex-Rays `ctree` 商业闭源插件 + POSIX 进程/调用栈污点模型**，几乎没有组件能够直接承载无操作系统、无文件系统、无网络协议栈的 ARM Cortex-M 裸机单体 ELF。
+   - 公开代码库自身存在多处显式断点（如 `Pre_Fuzzing/run.sh` 注释了 LLM API 提取调用、`Distance.py` 采用固定 4 字节步长近似而非真实基本块控制流图、缺乏会话级请求/Token 硬顶与子进程回收治理）。
+2. **避免“边补缺口边塞分支”带来的历史包袱与归因混杂**：
+   - **工程与复现代价**：若强行在原仓库上“一边补全原版缺失环节、一边硬塞 P2IM 裸机分支”，既背负大量与裸机 MCU 无关的 Linux/IDA 依赖包袱，改出的混合体也不再是对原版 FirmAgent 的严格复现。
+   - **研究定位与归因清晰度**：若表述为“把原版 FirmAgent 补全后搬到 P2IM”，容易将研究贡献矮化为工程移植，且把“框架补全、P2IM 底座修复、静态数据流切片、LLM 种子提案”混成一团无法拆账。将架构独立聚焦于裸机 MCU 特有问题（**中断 ISR 与主循环经共享 SRAM 异步交互而无函数调用边、无 MMU 下指针写穿跳入外设 MMIO 区取指失控、两段式闭环跨段外设模型与队列延续**），并内置可独立剥离的四路对照（`B0` 裸结果 vs `B0` + 共享 SRAM 切片 vs 无模型 `offline` vs 完整 `real`），才能干净回答每一层机制的真实净收益。
+
+### 2. 基于 Pi 与 FirmAgent 核心思想的技术重构路线
+
+本项目延续 FirmAgent **“静态/数据流切片引导 + 大模型受控协同模糊测试”** 的方法论内核，但在实现上以 **Pi SDK (`0.85.1`) 受控底座 + 原版 P2IM 裸机执行后端** 全新构建：
+
+- **受控宿主与治理层（基于 Pi SDK `0.85.1`）**：采用 `@earendil-works/pi-coding-agent` 与 `@earendil-works/pi-ai` 组装受控会话（`src/core/session.ts`）、串行请求与 Token 硬预算账本 `RunGovernance`（`src/campaign/governance.ts`）、进程启动身份核验回收（`src/campaign/owned-process.ts`）以及只读 `ToolEnvelope` 工具契约（零自由 Shell、零越界文件访问、内置 `assertNoLeak` 真值防泄漏拦截），并以独立的 `Mcup2imCampaign`（`src/campaign/mcu-runtime.ts`）承载裸机状态机。
+- **裸机执行与开源切片后端（面向 P2IM）**：底层驱动经最小非侵入补丁适配的原版 P2IM（QEMU + AFL，全程锁定 10 份未修补原版 ELF 的 SHA256），由宿主桥接器 `tools/p2im_oracle.py` 基于开源 `arm-none-eabi-objdump` / `nm` 构建跨中断 `via_shared_global` 与 `indexed_reach` 共享 SRAM 切片（显式标注 `call_edge: false`），彻底摆脱闭源 IDA 依赖。
+- **编排形态——“宿主固定阶段流水线（`pipeline`）+ 中场单会话（`main`）聚焦提案”**：
+  - **无子代理派工、无自由循环**：全生命周期 `prepare → model → discover_seg1 → slice → analyze_and_propose → discover_seg2 → triage_and_verify → score` 由 TypeScript 宿主确定性推进，不引入多子代理通信与调度损耗。
+  - **确定性执行归宿主，LLM 预算 100% 集中于切片审计与协议种子提案**：前后两段模糊测试（`discover_seg1` / `discover_seg2`）及后置崩溃三次重放与字节消融验证（`triage_and_verify`，默认 `replay_model_calls = 0` 由宿主确定性完成，仅在显式传 `--replay-model-calls > 0` 时开启消融会话）均由宿主直接驱动；默认**仅在中场 `analyze_and_propose` 阶段开启 1 个 `main` 会话**审计共享 SRAM 切片并提交经 CRC16/长度校验的协议种子与越界假设，杜绝无效 Token 空转。
+
+---
+
 ## Architecture / 运行架构
 
 ```mermaid

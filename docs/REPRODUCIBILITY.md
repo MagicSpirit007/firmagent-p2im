@@ -11,7 +11,9 @@
 
 ## 第一部分：科研动机、设计理据与三层改动全解
 
-### 1.1 问题域差异：为何不能将 Linux 路由器 FirmAgent 原样迁移至裸机 MCU？
+### 1.1 问题域差异与架构选型：为何不直接在原版 FirmAgent 上硬改，以及基于 Pi 的技术路线
+
+#### 1.1.1 问题域差异：为何不能将 Linux 路由器 FirmAgent 原样迁移至裸机 MCU？
 
 Linux 网络固件（如路由器 `httpd`/`upnpd`）的 Agent 协同模糊测试依赖 POSIX 操作系统抽象；而 P2IM 基准面向无操作系统的 ARM Cortex-M3/M4 单体 ELF，二者在五个基础维度存在本质错配：
 
@@ -22,6 +24,19 @@ Linux 网络固件（如路由器 `httpd`/`upnpd`）的 Agent 协同模糊测试
 | **跨上下文数据流形态** | 参数顺调用栈显式传递，静态 Callgraph 即可串联 `source -> sink` | **中断服务例程（ISR）读 UART DR → 写入全局 SRAM 环形缓冲 → 主循环状态机异步轮询消费**；二者之间**不存在直接函数调用边** | `slice-paths` 构造独立于调用图的 **`via_shared_global` 与 `indexed_reach` 共享 SRAM 切片**，并显式标注 `call_edge: false` |
 | **漏洞故障可观测形式** | 内核拦截 `SIGSEGV`/ASan 报告，拥有丰富栈回溯 | 无 MMU/OS 保护，常见表现为：1）溢出覆盖相邻全局函数指针（如 `rx_callback`），跳入外设区 `0x40000000..0x5fffffff` 取指；2）在下游受害回调（如 `HAL_UART_RxCpltCallback`）崩溃 | QEMU 侧增加外设取指保护 `PM_EXEC_PERI = 0x72`；验证层叠加 **3 次确定性重放 (`L3`) + Contrast 决定性字节消融 (`L4`) + 共享 SRAM 上溯归因 (`L5`)** |
 | **开放式 Agent 风险** | 模型自由跑 Shell 易烧光预算、修改被测文件或通过联网/文件检索泄露 CVE 真值 | 单次 MCU 变异窗口耗时数十到数百秒，开放 Shell 更容易死锁或污染对比基准 | 以 Pi SDK (`0.85.1`) 托管双段固定状态机 + 只读 SHA256 工件切片 + `RunGovernance` 严控账本 + `assertNoLeak` 防泄漏拦截 |
+
+#### 1.1.2 为何不直接在原版 `vul337/FirmAgent` 代码库上修改？我们采用了什么技术路线？
+
+1. **为什么不直接在原版 `vul337/FirmAgent` 仓库上修补扩展？**
+   - **代码强耦合与自身断点**：原版 `vul337/FirmAgent`（`ea0dbdd`）重度耦合于 Greenhouse 容器重托管、HTTP URI/参数网络变异器、闭源商业软件 IDA Pro Hex-Rays `ctree` 插件与 POSIX 调用栈污点假设，几乎不存在可直接复用于 ARM Cortex-M 裸机单体 ELF 的模块；同时原公开仓库本身带有多处未闭合断点（如 `Pre_Fuzzing/run.sh` 注释了 LLM API 提取脚本、`Distance.py` 实为固定 4 字节步长近似而非真实基本块控制流图、缺少请求/Token 硬账本与进程组清理治理）。
+   - **规避工程包袱与收益归因失真**：若在原仓库上“一边修补原仓断点、一边强塞裸机 P2IM 分支”，既背负与裸机无关的 Linux/IDA 历史包袱，改出的系统也无法算作对原版 FirmAgent 的严格复现；更重要的是，从论文与实验方法学视角看，“补全 + 移植”不仅容易把针对裸机核心难点（ISR 与主循环共享 SRAM 无调用边耦合、无 MMU 外设区取指失控、跨段外设模型与队列延续）的方法创新弱化为工程移植，还会把“框架补全、P2IM 底座修复、共享 SRAM 静态切片、大模型提案”混杂在一起，导致无法干净剥离各组件净收益。
+
+2. **本研究基于 Pi 与 FirmAgent 核心思想的技术路线**：
+   - **保留核心思想，重构受控底座与开源裸机后端**：吸收 FirmAgent“程序切片引导大模型协同模糊测试”的思想内核，上层基于 **Pi SDK (`0.85.1`)** 构建受控会话（`src/core/session.ts`）、串行预算硬账本 `RunGovernance`（`src/campaign/governance.ts`）、进程身份核验清理（`src/campaign/owned-process.ts`）与只读 `ToolEnvelope` 工具契约（禁自由 Shell、禁越界路径、内置 `assertNoLeak` 防真值泄漏），以独立的 `Mcup2imCampaign`（`src/campaign/mcu-runtime.ts`）专职服务裸机实验；下层对接原版 P2IM QEMU/AFL（零修改 10 份被测 ELF 字节），在 `tools/p2im_oracle.py` 中使用开源 `arm-none-eabi-objdump` / `nm` 实现跨中断共享 SRAM 切片（`via_shared_global` 与 `indexed_reach`），替代闭源 IDA 依赖。
+   - **采用“宿主固定阶段流水线（`pipeline`）+ 中场单会话（`main`）聚焦提案”的精简编排**：
+     - 全流程 `prepare → model → discover_seg1 → slice → analyze_and_propose → discover_seg2 → triage_and_verify → score` 由 TypeScript 宿主状态机固定驱动，不采用多子代理层层派工（零子代理调度开销），也不交给单会话自由编排全流程；
+     - 前后两段模糊测试（`discover_seg1` / `discover_seg2`）及后置崩溃重放消融（`triage_and_verify`，默认 `replay_model_calls = 0` 由宿主确定性完成 `L3/L4`，仅在显式指定 `--replay-model-calls > 0` 时才开重放会话做消融）全部由宿主直接调用 `p2im_oracle.py` 完成；
+     - 默认**仅在中场 `analyze_and_propose` 阶段开启 1 个受控 `main` 会话**，将全部 LLM 调用与 Token 预算集中在“审计共享 SRAM 切片、记录越界假设（`hypothesis_note`）、提交通过长度与 CRC16 校验的协议种子（`seed_propose`）”这一最能发挥大模型语义推理价值的环节，并配套四路归因分离评估（`B0` 裸结果、`B0` + 离线共享 SRAM 切片、无模型 `offline`、完整 `real`）。
 
 ---
 
