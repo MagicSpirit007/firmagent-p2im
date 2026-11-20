@@ -18,6 +18,8 @@ PATTERN = re.compile(r"(CVE-\d{4}-\d+|CWE-\d+|Table\s*5|Table5)", re.IGNORECASE)
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_PROMPT_SOURCE = os.path.join(REPO_ROOT, "dist", "src", "campaign", "mcu-runtime.js")
 ALT_PROMPT_SOURCE = os.path.join(REPO_ROOT, "src", "campaign", "mcu-runtime.ts")
+DEFAULT_TOOLS_SOURCE = os.path.join(REPO_ROOT, "dist", "src", "campaign", "mcu-tools.js")
+ALT_TOOLS_SOURCE = os.path.join(REPO_ROOT, "src", "campaign", "mcu-tools.ts")
 
 
 def sha256_file(path: str) -> str:
@@ -42,12 +44,37 @@ def main() -> int:
     parser.add_argument("--out", help="Optional output JSON report path")
     args = parser.parse_args()
 
+    cand_work_dir = None
+    if args.candidates and os.path.isfile(args.candidates):
+        try:
+            with open(args.candidates, "r", encoding="utf-8", errors="replace") as handle:
+                cand_payload = json.load(handle)
+            if isinstance(cand_payload, dict) and isinstance(cand_payload.get("work_dir"), str) and cand_payload["work_dir"]:
+                cand_work_dir = cand_payload["work_dir"]
+        except Exception:
+            pass
+
+    if args.work_dir and cand_work_dir:
+        if os.path.abspath(args.work_dir) != os.path.abspath(cand_work_dir):
+            print(json.dumps({
+                "ok": False,
+                "error": "work_dir_mismatch",
+                "arg_work_dir": os.path.abspath(args.work_dir),
+                "candidates_work_dir": os.path.abspath(cand_work_dir),
+            }, indent=2), file=sys.stderr)
+            return 2
+
+    effective_work_dir = args.work_dir or cand_work_dir
+
     artifacts = []
-    if args.work_dir:
-        artifacts.append(os.path.join(args.work_dir, "analysis", "sources.json"))
-        artifacts.append(os.path.join(args.work_dir, "analysis", "paths.json"))
+    if effective_work_dir:
+        artifacts.append(os.path.join(effective_work_dir, "analysis", "sources.json"))
+        artifacts.append(os.path.join(effective_work_dir, "analysis", "paths.json"))
     if args.candidates:
         artifacts.append(args.candidates)
+        ledger_sibling = os.path.join(os.path.dirname(os.path.abspath(args.candidates)), "ledger.jsonl")
+        if os.path.isfile(ledger_sibling) and ledger_sibling not in args.extra:
+            artifacts.append(ledger_sibling)
     artifacts.extend(args.extra)
 
     surfaces = []
@@ -67,10 +94,17 @@ def main() -> int:
     else:
         surfaces.append({"where": prompt_path, "missing": True, "hit_count": None})
 
+    if not args.prompt_source:
+        tools_path = DEFAULT_TOOLS_SOURCE if os.path.exists(DEFAULT_TOOLS_SOURCE) else ALT_TOOLS_SOURCE
+        if os.path.exists(tools_path):
+            with open(tools_path, "r", encoding="utf-8", errors="replace") as handle:
+                surfaces.append(scan(handle.read(), tools_path + "#tools"))
+
     total_hits = sum(item.get("hit_count") or 0 for item in surfaces)
     missing = [item["where"] for item in surfaces if item.get("missing")]
     result = {
         "schema": "mcu-p2im/leak-check-0.2",
+        "work_dir": effective_work_dir,
         "leak_in_prompt": total_hits > 0,
         "pattern": PATTERN.pattern,
         "surfaces": surfaces,
@@ -83,6 +117,7 @@ def main() -> int:
             json.dump(result, handle, indent=2)
             handle.write("\n")
     print(json.dumps({
+        "work_dir": effective_work_dir,
         "leak_in_prompt": result["leak_in_prompt"],
         "total_hits": total_hits,
         "surfaces": len(surfaces),

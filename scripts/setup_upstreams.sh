@@ -103,7 +103,7 @@ pushd "$QEMU_BUILD_DIR" >/dev/null
   --extra-cflags="$(pkg-config --cflags jansson 2>/dev/null || true)" \
   --extra-ldflags="$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)"
 
-if ! grep -q 'ljansson' config-host.mak; then
+if ! grep -qE '^LIBS[[:space:]]*\+?=.*-ljansson([[:space:]]|$)' config-host.mak; then
   echo "QEMU_CFLAGS+=$(pkg-config --cflags jansson 2>/dev/null || true)" >> config-host.mak
   echo "LIBS+=$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)" >> config-host.mak
 fi
@@ -140,11 +140,13 @@ chmod +x "$P2IM_TOOLS_ROOT/scripts/fuzz.py" "$P2IM_TOOLS_ROOT/scripts/me.py" \
 echo "[7/7] Verifying 10 unpatched ELF SHA256 hashes and generating configs/m3/*.json..."
 python3 - "$REPO_ROOT/docs/P2IM_10_UNPATCHED_MANIFEST.json" "$P2IM_ROOT" "$HOEDUR_EXPERIMENTS_ROOT" <<'PY'
 import hashlib, json, sys
-manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+with open(sys.argv[1], encoding="utf-8") as fh:
+    manifest = json.load(fh)
 p2im_root, hoedur_root = sys.argv[2].rstrip("/"), sys.argv[3].rstrip("/")
 for item in manifest["targets"]:
     path = item["path"].replace("${P2IM_ROOT}", p2im_root).replace("${HOEDUR_EXPERIMENTS_ROOT}", hoedur_root)
-    h = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    with open(path, "rb") as elf_fh:
+        h = hashlib.sha256(elf_fh.read()).hexdigest()
     assert h == item["sha256"], f"SHA256 mismatch for {item['target']}: got {h}, expected {item['sha256']}"
     print(f"  OK {item['target']:17s} {h[:12]}... ({item['board']['qemu_board']})")
 PY

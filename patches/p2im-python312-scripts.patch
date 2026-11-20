@@ -1,5 +1,5 @@
 diff --git a/cov.py b/cov.py
-index 7ce8a09..bf679cf 100644
+index 7ce8a09..197985c 100644
 --- a/cov.py
 +++ b/cov.py
 @@ -38,7 +38,7 @@ def color_print(s, color="green"):
@@ -11,8 +11,27 @@ index 7ce8a09..bf679cf 100644
      parser.read(cfg_f)
  
      return Namespace(
+@@ -58,8 +58,7 @@ def read_config(cfg_f):
+     )
+ 
+ def sigterm_handler(signum, stack_frame):
+-    # kill all qemu instances forked
+-    subprocess.call(["killall", cfg.qemu_bin])
++    # Scoped process-group cleanup is owned by p2im_oracle.py; never run global killall.
+     color_print("py script is killed!", "yellow")
+     sys.exit("py script is killed!")
+ 
+@@ -157,7 +156,7 @@ def inst_cov(cfg):
+                         op = op[op.find(non_boot_code_start_addr):]
+ 
+                 # use group primitive--() to retreive start, end of each BBL
+-                BBLs = re.findall('BBL \((0x[0-9a-f]+), (0x[0-9a-f]+)\)', op)
++                BBLs = re.findall(r'BBL \((0x[0-9a-f]+), (0x[0-9a-f]+)\)', op)
+                 for (start, end) in BBLs:
+                     s = int(start, 16)
+                     e = int(end, 16)
 diff --git a/fuzz.py b/fuzz.py
-index f28a035..44f694b 100644
+index f28a035..9542160 100644
 --- a/fuzz.py
 +++ b/fuzz.py
 @@ -20,6 +20,8 @@ import configparser
@@ -33,7 +52,13 @@ index f28a035..44f694b 100644
      parser.read(cfg_f)
  
      return Namespace(
-@@ -75,6 +77,7 @@ if __name__ == "__main__":
+@@ -71,15 +73,19 @@ if __name__ == "__main__":
+         action='store_true', help="don't run fuzzer")
+     parser.add_argument("--no-skip-deterministic", dest="no_skip_deterministic",
+         action='store_true', help="don't skip deterministic steps of afl")
++    parser.add_argument("--skip-seed-prefix", dest="skip_seed_prefix", default=None,
++        help="skip pre-AFL per-seed ME probe for inherited seeds starting with this prefix")
+     # TODO option for resume fuzzer
  
      args = parser.parse_args()
      #print args
@@ -41,8 +66,35 @@ index f28a035..44f694b 100644
  
      if args.config:
        args.config = os.path.abspath(args.config)
+ 
+-    if args.model_if and not os.path.isfile(args.model_if):
++    explicit_model_if = os.path.abspath(args.model_if) if args.model_if else None
++    if explicit_model_if and not os.path.isfile(explicit_model_if):
+       sys.exit("model file provided with --model-if doesn't exist.")
+ 
+     cfg = read_config(args.config)
+@@ -113,7 +119,7 @@ if __name__ == "__main__":
+ 
+       logging.info("execution time: %f" % (time.time() - start_time))
+ 
+-    args.model_if = os.path.abspath("%s/peripheral_model.json" % run_num)
++    args.model_if = explicit_model_if or os.path.abspath("%s/peripheral_model.json" % run_num)
+     print('')
+ 
+ 
+@@ -121,7 +127,9 @@ if __name__ == "__main__":
+     color_print("extract model for each seed input", "blue")
+     prev_run_num = run_num
+ 
+-    for seed0 in os.listdir(cfg.afl_seed):
++    for seed0 in sorted(os.listdir(cfg.afl_seed)):
++      if seed0.startswith(".") or (args.skip_seed_prefix and seed0.startswith(args.skip_seed_prefix)):
++        continue
+       seed = "%s/%s" % (cfg.afl_seed, seed0)
+       seed_run = 1
+ 
 diff --git a/me.py b/me.py
-index e08a21f..2754798 100644
+index e08a21f..cc570e9 100644
 --- a/me.py
 +++ b/me.py
 @@ -21,6 +21,8 @@ import configparser
@@ -63,7 +115,7 @@ index e08a21f..2754798 100644
      parser.read(cfg_f)
  
      return Namespace(
-@@ -173,20 +175,28 @@ def qemu_run(cmd, retry_num, stage):
+@@ -173,25 +175,33 @@ def qemu_run(cmd, retry_num, stage):
      rv = {1: [0x20, 0x19, 0x30], 2: [0x21, 0x23],
            1.1: [0x20, 0x30]}
      error_rv = {2: {0x24: "Cannot find SR Model which is supposed to exist"}}
@@ -99,7 +151,23 @@ index e08a21f..2754798 100644
  
  def cnt_bbl_cov(trace_f):
      bc = {}
-@@ -1040,6 +1050,7 @@ def stage2_5(srr_info, s2_dir, term_cond0, checked_bcs, trace_sig, inv_num=1):
+     # bc = {(hex_str(bbl_s), hex_str(bbl_e)): cnt}
+-    bbls = re.findall('BBL \((0x[0-9a-f]+), (0x[0-9a-f]+)\)', open(trace_f).read())
++    bbls = re.findall(r'BBL \((0x[0-9a-f]+), (0x[0-9a-f]+)\)', open(trace_f).read())
+     for bbl in bbls:
+         if bbl in bc:
+             bc[bbl] += 1
+@@ -200,8 +210,7 @@ def cnt_bbl_cov(trace_f):
+     return bc
+ 
+ def sig_handler(signo, stack_frame):
+-    # kill all qemu instances forked
+-    subprocess.call(["killall", cfg.qemu_bin])
++    # Scoped process-group cleanup is owned by p2im_oracle.py; never run global killall.
+     color_print("py script is killed!", "yellow")
+     sys.exit("py script is killed!")
+ 
+@@ -1040,6 +1049,7 @@ def stage2_5(srr_info, s2_dir, term_cond0, checked_bcs, trace_sig, inv_num=1):
  
  
  if __name__ == "__main__":

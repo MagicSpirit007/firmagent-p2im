@@ -36,8 +36,8 @@ Linux 网络固件（如路由器 `httpd`/`upnpd`）的 Agent 协同模糊测试
 | **1. Python 3.12 移除 `SafeConfigParser`** | 运行 `fuzz.py` / `me.py` / `cov.py` 立即抛出 `AttributeError: module 'configparser' has no attribute 'SafeConfigParser'`；若仅改名 `ConfigParser` 而忘记传 `inline_comment_prefixes=('#', ';')`，P2IM 模板里 `fuzz.cfg` 的行内注释会被当成路径/数值的一部分引发语法报错 | [`patches/p2im-python312-scripts.patch`](../patches/p2im-python312-scripts.patch)：在 3 份脚本中改用 `configparser.ConfigParser(inline_comment_prefixes=('#', ';'))`，修复 `me.py` 中 `error_rv.get` 判断，保留 `qemu-stderr.txt` 故障现场 | **Before**: Python 3.12 零步退出<br>**After**: 原生 Python 3.12 稳定执行 `me.py`/`fuzz.py`/`cov.py` 并将 QEMU stderr 完整留证 |
 | **2. WSL2 / 容器环境下的 AFL 自检失败** | 缺少 `AFL_SKIP_CPUFREQ`、`AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES`、`AFL_NO_AFFINITY`、`AFL_SKIP_CRASHES` 时，AFL 在调频缩放与 `/proc/sys/kernel/core_pattern` 管道模式下直接拒跑；Python stderr 缓冲也会掩盖 `me.py` 失败原因 | [`p2im-shim/wsl_compat.py`](../p2im-shim/wsl_compat.py) 与 `p2im_oracle.py` `tool_env()`：统一注入上述环境变量与 `PYTHONUNBUFFERED=1`，并生成 bash `me` 包装脚本规避 `#!` / CRLF 差异 | **Before**: WSL2 默认配置下 AFL 拒跑或无错误回显<br>**After**: 开箱即绕过容器化宿主的无关自检，同时保留 `core_pattern=core` 显式校验 |
 | **3. 随包 2017 年 `libglib` 与宿主库符号冲突** | 上游预编译发行包在 `qemu/` 目录自带 2017 年 `librt*.so`、`libutil*.so`（glibc 2.19 `GLIBC_PRIVATE` 不兼容）与 `libglib-2.0.so.0`（2.51）。若将现代重编 QEMU 放进同一目录或设了 `LD_LIBRARY_PATH`，动态链接立即报错 `undefined symbol: g_string_free_and_steal` | `scripts/setup_upstreams.sh` 从源码重编本地版 QEMU 并安装至 `$P2IM_TOOLS_ROOT/qemu/`；[`tools/p2im_oracle.py`](../tools/p2im_oracle.py) `Work.install_shim()` 在工作区生成包装脚本，`unset LD_LIBRARY_PATH` 后 `exec` 真 QEMU | **Before**: 启动 QEMU 即动态链接崩溃或受宿主旧库污染<br>**After**: 与旧版 2017 动态库完全解耦，零符号冲突启动 |
-| **4. 缺失 `psmisc` 导致 `me.py` 半途崩溃** | P2IM 的 `me.py` 与 `cov.py` 依赖外部命令 `killall` 清理后台 QEMU；最小化 Ubuntu / WSL2 默认无此命令，导致 Round 0 无法收尾 | 在前置依赖明确强制 `psmisc`（`killall`）与 `binutils-arm-none-eabi`，`setup_upstreams.sh` 启动即校验；`tools/p2im_oracle.py` 额外通过进程组与 `/proc/<pid>/cmdline` `sweep_work()` 双重清场 | **Before**: `me.py` 抛 `killall: not found` 或残留僵尸 QEMU<br>**After**: 每个子命令结束零 QEMU/AFL 进程残留 |
-| **5. AFL `-c` 100 字节限制与 WSL 9p `fsync EPERM`** | P2IM `afl-fuzz.c` 对 `-c <fuzz.cfg>` 或模型路径存在硬编码长度限制（`>= 100` 字节即触发 `PROGRAM ABORT`）；在 `/mnt/c` 等 9p 目录运行 Node/AFL 会遇到 `EPERM: fsync` | [`scripts/generate_configs.py`](../scripts/generate_configs.py) 与 `p2im_oracle.py` 在 `prepare`/`fuzz` 阶段即计算最长路径 `0.random.1/peripheral_model.json` 并硬断言 `< 100` 字节，超限立即礼貌拒绝 | **Before**: 运行数分钟进入 AFL 才因路径超长 `PROGRAM ABORT`<br>**After**: 配置生成与 `prepare` 秒级拒绝不合规路径 |
+| **4. 全局 `killall` 跨工作区误杀与残留清理** | 原版 `me.py` / `cov.py` 信号处理直接调用全局 `killall qemu-system-gnuarmeclipse`，多窗并行时会误杀同机其他实验；最小化镜像缺 `psmisc` 还会报错 | `patches/p2im-python312-scripts.patch` 移除脚本内无作用域 `killall`，交由 [`tools/p2im_oracle.py`](../tools/p2im_oracle.py) 按独立进程组与 `/proc/<pid>/cmdline` 精确限定本 `work_dir` 的 `sweep_work()` 收尾 | **Before**: 并行实验互相误杀或残留孤儿 QEMU<br>**After**: 严格按 `work_dir` 隔离清场，零跨窗干扰、零孤儿残留 |
+| **5. AFL `-c` 100 字节硬上限、`s2` 模型连续性与 WSL 9p `fsync`** | P2IM `afl-fuzz.c` 规定 `MODEL_IF_LEN = 100`；原版 `fuzz.py` 启动前对 `inputs-s2/` 每条种子生成 `0.<seed>.1/peripheral_model.json`（长队列名/SHA256 名达 `118B+` 立即 `PROGRAM ABORT`），且无条件把 `--model-if` 重置回 `0/` 丢弃 `s1` 累积模型 | `generate_configs.py` 与 `p2im_oracle.py` 预检 `0.seed-random.10/peripheral_model.json` `< 100B`；`prepare_segment_inputs()` 将 `inputs-s2/` 种子映射为 `<=5B` 短名（`b00`/`q0000`/`p00`，溯源表写入 `evidence/inputs-s2-map.json`）；`prepare_segment_model_continuity()` 将 `s1` 累积模型拷入 `0.s2/` 并配合 `--skip-seed-prefix q` 跳过冗余冷启动 | **Before**: `s2` 因长种子名超 `100B` 立即 `PROGRAM ABORT` 或丢失 `s1` 外设模型<br>**After**: 100% 满足 `<100B` 约束，`s2` 完整继承 `s1` 队列与累积外设模型 |
 
 ---
 
@@ -55,7 +55,7 @@ Linux 网络固件（如路由器 `httpd`/`upnpd`）的 Agent 协同模糊测试
 
 2. **外设 MMIO 区取指保护 `PM_EXEC_PERI = 0x72`**
    - **原版阻塞现象**：当固件缺陷（如全局缓冲越界写穿回调函数指针 `rx_callback`）把函数指针改写为外设地址区间 `0x40000000..0x5fffffff` 并执行 `blx r3` 时，QEMU 翻译期取指会走内存读路径并误触 `unassigned_mem_read`，使 P2IM 误以为“主循环访问了未建模外设寄存器（`0x40`）”而陷入无休止的模型重试死循环。
-   - **改动原理与源码位置**：在 `cputlb.c`、`memory.c`、`include/peri-mod/peri-mod.h`、`include/afl/afl-qemu-cpu-inl.h` 增加取指态标志 `pm_fetching_code` 与 `get_page_addr_code` 检查：若取指地址落入外设 MMIO 区间，立即输出 `guest_code_fetch addr=... pc=... r0=... r3=...` 现场寄存器并按 `PM_EXEC_PERI = 0x72`  cleanly exit；同时 `fuzz.py` / `me.py` / `cov.py` 将 `0x72` 纳入 `no_retry`，不让无效建模重试卡死流程。
+   - **改动原理与源码位置**：在 `cputlb.c`、`memory.c`、`include/peri-mod/peri-mod.h`、`include/afl/afl-qemu-cpu-inl.h` 增加取指态标志 `pm_fetching_code` 与 `get_page_addr_code` 检查：若取指地址落入外设 MMIO 区间，立即输出 `guest_code_fetch addr=... pc=... r0=... r3=...` 现场寄存器并按 `PM_EXEC_PERI = 0x72` cleanly exit；同时 `fuzz.py` / `me.py` / `cov.py` 将 `0x72` 纳入 `no_retry`，`p2im_oracle.py`（`parse_fault` / `replay_once`）将 `0x72` 与 `guest_code_fetch` 解析为确定性 `exec_peri` 崩溃纳入 `L2–L4` 验证。
    - **Before vs After**：
      - **Before**: 指针损坏跳入 MMIO 区时 `me.py` 不断触发伪造 `unmodeled_peri` 重试并丢失故障原因。
      - **After**: `0x40` 伪误报被抑制，真实 `guest_code_fetch` 现场被保存用于后续定性与溯源。
@@ -107,11 +107,11 @@ Linux 网络固件（如路由器 `httpd`/`upnpd`）的 Agent 协同模糊测试
    - 模型调用 `seed_propose` 提交协议帧时，宿主 `cmd_admit_seed()` 执行四关校验：合法偶数十六进制、长度 `1..256` 字节、若 `frame == "modbus_rtu"` 则末 2 字节必须匹配小端 `crc16_modbus(payload[:-2])`、防泄漏正则通过；合格种子写入独立目录 `proposed-seeds/<sha256>.bin`，**原 `inputs/` 目录一字节不动**，保证 `B0` / `s1` 可溯源对照。
    - 代码落盘严格区分五个验证层级（拒绝把“AFL 报的 crash 数”直接当漏洞数）：
      - **`L1`**（`layers.l1`）：AFL 产出的原始 crash 文件总数（`crashes.raw_files`）；
-     - **`L2`**（`layers.l2`）：至少复现出一次崩溃的唯一指纹数，按 `fault.kind | fault.address | last_bbl.function` 去重；
-     - **`L3`**（`layers.l3`）：经 `replay --repeat 3` 三次重放中 `outcome`、`fault.address` 与 `last_bbl.start` 全部一致的确定性崩溃数；
-     - **`L4`**（`layers.l4`）：经 `contrast` 在预算内缩减后，能找到**“删掉该决定性字节或再截断 1 字节后故障立即消失（`outcome != 'crash'`）”**的因果验证崩溃数（`contrast_confirmed === true`）；
-     - **`L5`**（`scripts/score_l5.py`，`l5-0.3`）：**独立于 Agent 进程之后运行**。修复了旧版丢弃 `## PLC` 章节标题行（`if stripped.startswith("#"): continue`）导致的零命中 Bug，按二级标题 `## <Firmware>` 切分 `P2IM_patching_notes.md`，将每个 `L3/L4` 候选分为：
-       - `known_p2im_bug_direct`：崩溃函数（优先检查，若无函数名或未命中再查地址）命中真值 `Affected function` 或补丁 `address:`；
+     - **`L2`**（`layers.l2`）：至少复现出一次崩溃的**唯一崩溃指纹数**（按 `fault.kind | fault.address | last_bbl.function` 去重；原始重放文件数另记于 `layers_files`）；
+     - **`L3`**（`layers.l3`）：经 `replay --repeat 3` 三次重放中 `outcome`、`fault.address` 与 `last_bbl.start` 全部一致的**唯一确定性崩溃指纹数**（严格满足 `L1 >= L2 >= L3 >= L4`，且 `triage_and_verify` 按 `outputs-s2` 优先轮询交错抽样，杜绝 `s1` 崩溃数较多时饿死 `s2` 新崩溃）；
+     - **`L4`**（`layers.l4`）：经 `contrast` 在预算内缩减后，能找到**“删掉该决定性字节或再截断 1 字节后故障立即消失（`outcome != 'crash'`）”**的**唯一因果验证崩溃指纹数**（`contrast_confirmed === true`）；
+     - **`L5`**（`scripts/score_l5.py`，`l5-0.4`）：**独立于 Agent 进程之后运行**。按二级标题 `## <Firmware>` 与三级 `### Bug` / `### Known, unpatched Bugs` 子节切分 `P2IM_patching_notes.md` 全部 5 个含真值目标（`CNC` 1、`Gateway` 3、`PLC` 4、`Heat_Press` 1、`Soldering_Iron` 3，共 12 个已知真值缺陷），结合纯 Python ELF32 `.symtab` 过滤 code-cave 借道补丁点并支持 `bbl_range` 区间匹配，输出**按唯一缺陷 ID（`bug_id`）去重的主指标 `unique_bugs`**（`unique_known_bugs_direct`、`unique_known_bugs_downstream`、`unique_known_bugs_total`、`matched_bug_ids`），同时保留候选级统计：
+       - `known_p2im_bug_direct`：崩溃函数、基本块区间 `bbl_range` 或地址直接命中真值缺陷；
        - `known_p2im_bug_downstream`：崩溃发生在下游受害点，但其经静态/共享 SRAM 关联出的 `upstream_functions` 命中已知根因函数；
        - `unmatched_verified_candidate`：确定性且因果有效，但未命中 P2IM 已知补丁列表。
 
@@ -127,12 +127,15 @@ Linux 网络固件（如路由器 `httpd`/`upnpd`）的 Agent 协同模糊测试
 
 **目的**：确保运行在具备 ARM 交叉符号/反汇编器、QEMU 编译头文件与 `Node.js >= 22.19.0` 的原生 Linux ext4 环境，并消除 WSL2/桌面系统因 `core_pattern` 管道转储造成的 AFL 误判崩溃。
 
+> **环境澄清（无需 Python `venv`）**：本仓库全部 Python 脚本及补丁后 P2IM 脚本均只依赖 Python 3 标准库（无 `requirements.txt` 或 `pip` 安装包）。请直接使用系统 `python3`（如 `3.12.3`），**不要**额外创建 Python 虚拟环境，以免子进程 PATH 切换导致版本偏差；Node.js 依赖由 `npm ci` 自动装入仓库内 `node_modules/`。
+>
+> **WSL2 重启提示**：WSL2 宿主机每次重启都会把 `/proc/sys/kernel/core_pattern` 重置为管道模式（如 `|/wsl-capture-crash ...`）。若复现期间重启过 WSL，开跑前务必重新执行下方 `1.3` 并确认输出为 `core`。
+
 在 Ubuntu Bash（WSL2 请先执行 `wsl -d Ubuntu-24.04`）执行：
 
 ```bash
 # 1.1 安装系统工具链与编译库（注意 psmisc 提供 killall，binutils-arm-none-eabi 提供 objdump/nm/readelf）
-sudo apt-get update
-sudo apt-get install -y \
+sudo apt-get update && sudo apt-get install -y \
   build-essential git pkg-config python3 psmisc \
   binutils-arm-none-eabi \
   libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libjansson-dev \
@@ -149,16 +152,17 @@ echo core | sudo tee /proc/sys/kernel/core_pattern
 cat /proc/sys/kernel/core_pattern   # 期望输出: core
 ```
 
-接下来锁定工作区路径环境变量（**建议写入当前终端或 `~/.bashrc`；全部位于 Linux 原生 ext4 且短于 100 字节上限**）：
+接下来锁定工作区路径环境变量。**多实验共存时建议将以下模板写为独立工作区的 `env.sh`（按需 `source env.sh`）**，将所有路径锚定到专属根目录与短路径工作区（`P2IM_WORK_ROOT` 必须位于 Linux 原生 ext4 且使最长模型路径 `< 100` 字节）：
 
 ```bash
-export REPO_ROOT="$HOME/firmagent-p2im"
-export DEPS_ROOT="$HOME/deps"
-export P2IM_ROOT="$DEPS_ROOT/p2im"
-export HOEDUR_EXPERIMENTS_ROOT="$DEPS_ROOT/hoedur-experiments"
-export P2IM_TOOLS_ROOT="$HOME/p2im-tools"
-export P2IM_WORK_ROOT="/tmp/fa-p2im"
-export QEMU_BUILD_DIR="$DEPS_ROOT/p2im-qemu-build"
+# 可保存为 ~/re-firmagent-p2im/env.sh 后执行: source ~/re-firmagent-p2im/env.sh
+export REPO_ROOT="${REPO_ROOT:-$HOME/re-firmagent-p2im/firmagent-p2im}"
+export DEPS_ROOT="${DEPS_ROOT:-$HOME/re-firmagent-p2im/deps}"
+export P2IM_ROOT="${P2IM_ROOT:-$DEPS_ROOT/p2im}"
+export HOEDUR_EXPERIMENTS_ROOT="${HOEDUR_EXPERIMENTS_ROOT:-$DEPS_ROOT/hoedur-experiments}"
+export P2IM_TOOLS_ROOT="${P2IM_TOOLS_ROOT:-$HOME/re-firmagent-p2im/p2im-tools}"
+export P2IM_WORK_ROOT="${P2IM_WORK_ROOT:-/tmp/re-fa-p2im}"
+export QEMU_BUILD_DIR="${QEMU_BUILD_DIR:-$DEPS_ROOT/p2im-qemu-build}"
 
 mkdir -p "$DEPS_ROOT" "$P2IM_TOOLS_ROOT/qemu" "$P2IM_TOOLS_ROOT/scripts" "$P2IM_WORK_ROOT"
 ```
@@ -173,22 +177,41 @@ mkdir -p "$DEPS_ROOT" "$P2IM_TOOLS_ROOT/qemu" "$P2IM_TOOLS_ROOT/scripts" "$P2IM_
 # 2.1 克隆本开源仓库至 Linux 原生 ext4
 git clone https://github.com/MagicSpirit007/firmagent-p2im.git "$REPO_ROOT"
 
-# 2.2 拉取固定版本的 RiS3-Lab/p2im 及其真实固件子模块
-git clone https://github.com/RiS3-Lab/p2im.git "$P2IM_ROOT"
-git -C "$P2IM_ROOT" checkout --force 0e64506a371b9c66ff67ed64a3fa65fa7e197e21
-git -C "$P2IM_ROOT" submodule update --init externals/p2im-real_firmware
+# 2.2 拉取固定版本的 RiS3-Lab/p2im 及其真实固件子模块（用 && 串联避免首步失败后级联报错）
+git clone https://github.com/RiS3-Lab/p2im.git "$P2IM_ROOT" && \
+git -C "$P2IM_ROOT" checkout --force 0e64506a371b9c66ff67ed64a3fa65fa7e197e21 && \
+git -C "$P2IM_ROOT" submodule update --init externals/p2im-real_firmware && \
 git -C "$P2IM_ROOT/externals/p2im-real_firmware" rev-parse HEAD
 # 期望输出: d4c7456574ce2c2ed038e6f14fea8e3142b3c1f7
 
 # 2.3 稀疏检出公开 hoedur-experiments（仅拉取未修补 Soldering_Iron.elf 与离线真值笔记）
 git clone --filter=blob:none --no-checkout \
-  https://github.com/fuzzware-fuzzer/hoedur-experiments.git "$HOEDUR_EXPERIMENTS_ROOT"
-git -C "$HOEDUR_EXPERIMENTS_ROOT" sparse-checkout init --cone
+  https://github.com/fuzzware-fuzzer/hoedur-experiments.git "$HOEDUR_EXPERIMENTS_ROOT" && \
+git -C "$HOEDUR_EXPERIMENTS_ROOT" sparse-checkout init --cone && \
 git -C "$HOEDUR_EXPERIMENTS_ROOT" sparse-checkout set \
   targets/arm/unpatched-est-data-set/P2IM/Soldering_Iron \
-  02-coverage-est-data-set/binary-patching
+  02-coverage-est-data-set/binary-patching && \
 git -C "$HOEDUR_EXPERIMENTS_ROOT" checkout 2babc78b72b1331b3122c11f170e9367132b8aa2
 ```
+
+<details>
+<summary>受限网络 / 无外网代理时的离线传包方案（git bundle + 浅克隆 git archive）</summary>
+
+1. `firmagent-p2im`、`p2im`、`p2im-real_firmware`（完整历史仓库）可在有网机器使用 `git bundle create <name>.bundle --all` 打包后传入目标机 `git clone <name>.bundle ...`。
+2. 若有网机器上的 `hoedur-experiments` 为 `--depth 1` 浅克隆，`git bundle` 会因缺少父提交在目标机 `git clone` 失败；本仓库所有脚本仅读取文件而不依赖其 `.git` 元数据，可用 `git archive` 精确导出所需两目录后再在目标机解压：
+
+```bash
+# 有网机器导出：
+git -C "$SRC_HOEDUR" archive 2babc78b72b1331b3122c11f170e9367132b8aa2 \
+  targets/arm/unpatched-est-data-set/P2IM/Soldering_Iron \
+  02-coverage-est-data-set/binary-patching \
+  -o hoedur-subset.tar
+
+# 目标机解压到 $HOEDUR_EXPERIMENTS_ROOT：
+mkdir -p "$HOEDUR_EXPERIMENTS_ROOT" && tar -xf hoedur-subset.tar -C "$HOEDUR_EXPERIMENTS_ROOT"
+```
+
+</details>
 
 **手工核验 10 个 ELF SHA256 与 `svc 0x3f` 实证差异**：
 
@@ -245,8 +268,10 @@ test -x "$P2IM_ROOT/afl/afl-fuzz" && "$P2IM_ROOT/afl/afl-fuzz" -h | head -n 5
 git -C "$REPO_ROOT" apply --stat patches/p2im-qemu-auto-forkserver.patch
 
 # 4.2 将补丁应用至 P2IM 内嵌的 qemu.git 源码树（先干跑检查无冲突）
+# 注：git apply 对 configure 与 scripts/tracetool.py 打印的 `type 100755, expected 100644`
+# 属于上游 Git 树文件模式正常提示，不影响补丁应用与后续可执行权限，可安全忽略。
 git -C "$P2IM_ROOT" apply --check --directory=qemu/src/qemu.git \
-  "$REPO_ROOT/patches/p2im-qemu-auto-forkserver.patch"
+  "$REPO_ROOT/patches/p2im-qemu-auto-forkserver.patch" && \
 git -C "$P2IM_ROOT" apply --directory=qemu/src/qemu.git \
   "$REPO_ROOT/patches/p2im-qemu-auto-forkserver.patch"
 
@@ -255,30 +280,28 @@ grep -E '^(CONFIG_STM32|CONFIG_KINETIS|CONFIG_SAM)=' \
   "$P2IM_ROOT/qemu/src/qemu.git/default-configs/gnuarmeclipse-softmmu.mak"
 # 期望输出包含: CONFIG_STM32=y 且 CONFIG_KINETIS=n、CONFIG_SAM=n
 
-# 4.4 在独立构建目录执行 configure 与 make
-mkdir -p "$QEMU_BUILD_DIR"
-pushd "$QEMU_BUILD_DIR"
-"$P2IM_ROOT/qemu/src/qemu.git/configure" \
-  --prefix="$QEMU_BUILD_DIR/install" \
-  --target-list=gnuarmeclipse-softmmu \
-  --python="$(command -v python3)" \
-  --disable-werror --disable-docs --disable-gtk --disable-sdl \
-  --disable-vnc --disable-xen --disable-kvm --disable-guest-agent \
-  --extra-cflags="$(pkg-config --cflags jansson 2>/dev/null || true)" \
-  --extra-ldflags="$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)"
-
-# 确认 config-host.mak 中链接了 -ljansson（P2IM peripheral_model JSON 序列化所需）
-grep -q 'ljansson' config-host.mak || {
-  echo "QEMU_CFLAGS+=$(pkg-config --cflags jansson 2>/dev/null || true)" >> config-host.mak
-  echo "LIBS+=$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)" >> config-host.mak
-}
-
-make -j"$(nproc)"
-popd
-
-# 4.5 安装并核验二进制符号
+# 4.4–4.5 在独立构建目录执行 configure、精确补齐 LIBS+=-ljansson、make、安装与符号核验
+# 注：Ubuntu 24.04 默认启用 ld --as-needed，--extra-ldflags 里的 -ljansson 位于 .o 之前会被丢弃；
+# 必须精确检测 `^LIBS` 行并将 -ljansson 追加到 LIBS 末尾。以下使用 && 串联以防中途静默失败。
+mkdir -p "$QEMU_BUILD_DIR" && \
+(
+  cd "$QEMU_BUILD_DIR" && \
+  "$P2IM_ROOT/qemu/src/qemu.git/configure" \
+    --prefix="$QEMU_BUILD_DIR/install" \
+    --target-list=gnuarmeclipse-softmmu \
+    --python="$(command -v python3)" \
+    --disable-werror --disable-docs --disable-gtk --disable-sdl \
+    --disable-vnc --disable-xen --disable-kvm --disable-guest-agent \
+    --extra-cflags="$(pkg-config --cflags jansson 2>/dev/null || true)" \
+    --extra-ldflags="$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)" && \
+  { grep -qE '^LIBS[[:space:]]*\+?=.*-ljansson([[:space:]]|$)' config-host.mak || {
+    echo "QEMU_CFLAGS+=$(pkg-config --cflags jansson 2>/dev/null || true)" >> config-host.mak &&
+    echo "LIBS+=$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)" >> config-host.mak
+  }; } && \
+  make -j"$(nproc)"
+) && \
 install -m 755 "$QEMU_BUILD_DIR/gnuarmeclipse-softmmu/qemu-system-gnuarmeclipse" \
-  "$P2IM_TOOLS_ROOT/qemu/qemu-system-gnuarmeclipse"
+  "$P2IM_TOOLS_ROOT/qemu/qemu-system-gnuarmeclipse" && \
 nm "$P2IM_TOOLS_ROOT/qemu/qemu-system-gnuarmeclipse" | grep ' T p2im_maybe_auto_forkserver'
 # 期望输出含: ... T p2im_maybe_auto_forkserver
 ```
@@ -329,30 +352,37 @@ python3 "$REPO_ROOT/scripts/generate_configs.py" \
 
 ---
 
-### Step 6：安装 Node.js 运行时、构建 TypeScript 并运行离线验证套件
+### Step 6：洁净树隐私自检、安装 Node.js 运行时、构建 TypeScript 并运行离线验证套件
 
-**目的**：锁定 Pi SDK `0.85.1` 及相关契约单测，在不调用外部收费 LLM（`model_requests = 0`）的情况下检验整个宿主编排层与 `score_l5.py` / `privacy_audit.py` 的契约正确性。
+**目的**：先在未构建的干净源码树完成发版前目录清洁度门禁（`hits=0`），再安装依赖、锁定 Pi SDK `0.85.1` 及相关契约单测，在不调用外部收费 LLM（`model_requests = 0`）的情况下检验宿主编排层与 `score_l5.py` 的契约正确性。
+
+> **切勿在构建之后删除 `node_modules/` 或 `dist/`！** `npm run verify:privacy` 默认检查仓库中是否存在发布禁止目录（`node_modules/`、`dist/`、`__pycache__/`）。因此必须在 `npm ci` **之前**执行；构建完成后如只需审计源码密钥与敏感字面量，请加 `--ignore-build-artifacts`。
 
 ```bash
 cd "$REPO_ROOT"
-npm ci --no-audit --no-fund
-npm run build
 
-# 6.1 TypeScript 契约测试（含 sharedViaRank 优先级、预算与防泄漏测试）
+# 6.0 发版前洁净门禁（在 npm ci / build 之前运行；期望 hits=0）
+python3 scripts/privacy_audit.py
+
+# 6.1 安装 Node 依赖并构建（国内或无代理环境可改用 --registry=https://registry.npmmirror.com）
+npm ci --no-audit --no-fund && npm run build
+# 如直连官方源超时：
+# npm ci --registry=https://registry.npmmirror.com --no-audit --no-fund && npm run build
+
+# 6.2 TypeScript 契约测试（含预算/thinking/截断诊断/队列继承/B0 归因与防泄漏测试）
 npm test
-# 期望: 8/8 通过 (fail 0)
 
-# 6.2 Python Oracle 与 L5 计分器单测（挂载真实 ELF 与 Notes 时全量执行 24 项）
+# 6.3 Python Oracle 与 L5 计分器单测（挂载真实 ELF 与 Notes 时全量通过且 0 条跳过、0 条 ResourceWarning）
 P2IM_ROOT="$P2IM_ROOT" \
+HOEDUR_EXPERIMENTS_ROOT="$HOEDUR_EXPERIMENTS_ROOT" \
 P2IM_NOTES="$HOEDUR_EXPERIMENTS_ROOT/02-coverage-est-data-set/binary-patching/P2IM_patching_notes.md" \
 npm run test:py
-# 期望: Ran 24 tests ... OK（若未挂载 P2IM_ROOT/P2IM_NOTES，22 项通过 + 2 项真值依赖跳过）
 
-# 6.3 隐私与目录清洁度自检
-npm run verify:privacy
+# 6.4 构建后如仅复查源码密钥/敏感字面量（保留 node_modules 与 dist）：
+python3 scripts/privacy_audit.py --ignore-build-artifacts
 # 期望: hits=0
 
-# 6.4 CLI 只读连通自检（不发模型请求、不读取密钥内容）
+# 6.5 CLI 只读连通自检（不发模型请求、不读取密钥内容）
 node dist/src/cli.js doctor --provider deepseek --model deepseek-v4-flash
 ```
 
@@ -447,12 +477,12 @@ python3 "$REPO_ROOT/tools/p2im_oracle.py" admit-seed \
 # 辅助公式：用自带 crc16_modbus 为任意自定义 Modbus 请求体计算小端 CRC16
 python3 -c 'import sys; sys.path.insert(0, "tools"); import p2im_oracle as o; b=bytes.fromhex("010100000010"); c=o.crc16_modbus(b); print((b+bytes((c&0xff, c>>8))).hex())'
 
-# 核验原 inputs/ 依然只有 2 枚原始种子，而 proposed-seeds/ 独立存放提案种子
+# 核验原 inputs/ 与 outputs-s1/ 依然完整只读，而 proposed-seeds/ 独立存放提案种子
 ls -la "$WORK_MANUAL/plc/inputs/" "$WORK_MANUAL/plc/proposed-seeds/"
 
-# 开启 --include-proposed 跑第二段（s2 从 inputs-s2/ 拷贝 inputs + proposed-*.bin，不污染 inputs/）
+# 开启 --inherit-queue s1 --include-proposed 跑第二段（inputs-s2/ 用短文件名 b00/q0000/p00 汇总 inputs + outputs-s1/queue/* + proposed-*.bin，映射关系写入 evidence/inputs-s2-map.json，累积外设模型延续至 0.s2/，不污染 inputs/ 与 outputs-s1/）
 python3 "$REPO_ROOT/tools/p2im_oracle.py" fuzz \
-  --target PLC --segment s2 --seconds 60 --include-proposed --work-root "$WORK_MANUAL"
+  --target PLC --segment s2 --seconds 60 --inherit-queue s1 --include-proposed --work-root "$WORK_MANUAL"
 ```
 
 #### 7.6 确定性重放（`L3`）与 Contrast 决定性字节消融（`L4`）+ 可选硬件写断点观察
@@ -460,20 +490,24 @@ python3 "$REPO_ROOT/tools/p2im_oracle.py" fuzz \
 ```bash
 python3 "$REPO_ROOT/tools/p2im_oracle.py" crashes --target PLC --work-root "$WORK_MANUAL"
 
-# 从上面 crashes 输出中复制一条 crash 的 id（例如 id:000000,ret_v:0xff,...）
-CRASH_ID="$(python3 -c 'import json; d=json.load(open("/tmp/fa-manual/plc/evidence/crash-index.json")); print(d["crashes"][0]["id"])')"
+# 从上面 crashes 输出中安全读取第一条 crash id（60s 短窗可能暂无 crash，切勿直接下标 [0] 否则 IndexError）
+CRASH_ID="$(python3 -c 'import json; d=json.load(open("/tmp/fa-manual/plc/evidence/crash-index.json")); print(d["crashes"][0]["id"] if d.get("crashes") else "")')"
+echo "CRASH_ID=${CRASH_ID:-<none_in_60s>}"
+# 若 CRASH_ID 为空（60s 短窗 0 crash），可补跑一段 300s 窗口（--segment s3 --seconds 300 --inherit-queue s2）或直接进入 Step 8（300s×2）
 
-# L3: 连续重放 3 次，期望 deterministic: true
-python3 "$REPO_ROOT/tools/p2im_oracle.py" replay \
-  --target PLC --input "$CRASH_ID" --repeat 3 --work-root "$WORK_MANUAL"
+if [ -n "$CRASH_ID" ]; then
+  # L3: 连续重放 3 次，期望 deterministic: true
+  python3 "$REPO_ROOT/tools/p2im_oracle.py" replay \
+    --target PLC --input "$CRASH_ID" --repeat 3 --work-root "$WORK_MANUAL"
 
-# L4: Contrast 缩小种子并删去单字节验证因果消失（输出 contrast_confirmed: true 与 decisive_byte）
-python3 "$REPO_ROOT/tools/p2im_oracle.py" contrast \
-  --target PLC --input "$CRASH_ID" --op trim --max-replays 40 --work-root "$WORK_MANUAL"
+  # L4: Contrast 缩小种子并删去单字节验证因果消失（输出 contrast_confirmed: true 与 decisive_byte）
+  python3 "$REPO_ROOT/tools/p2im_oracle.py" contrast \
+    --target PLC --input "$CRASH_ID" --op trim --max-replays 40 --work-root "$WORK_MANUAL"
 
-# 可选（若已安装 gdb-multiarch）：在疑似越界对象 rx_callback (0x20000214) 下数据写断点验证写穿现场
-python3 "$REPO_ROOT/tools/p2im_oracle.py" gdb-watch \
-  --target PLC --input "$CRASH_ID" --watch 0x20000214 --work-root "$WORK_MANUAL"
+  # 可选（若已安装 gdb-multiarch）：在疑似越界对象 rx_callback (0x20000214) 下数据写断点验证写穿现场
+  python3 "$REPO_ROOT/tools/p2im_oracle.py" gdb-watch \
+    --target PLC --input "$CRASH_ID" --watch 0x20000214 --work-root "$WORK_MANUAL"
+fi
 ```
 
 #### 7.7 两大关键兼容性特例手工对比验证（`Soldering_Iron` 与 `Reflow_Oven`）
@@ -502,11 +536,48 @@ python3 "$REPO_ROOT/tools/p2im_oracle.py" fuzz --target Reflow_Oven --segment s1
 # 验证：execs_done > 0 且无 "PROGRAM ABORT"
 ```
 
+#### 7.8 一屏只读体检与工作根级残留进程核查
+
+```bash
+# 使用只读 verify_step7.py 一屏汇总检查 SHA256、QEMU、smoke、me、segments、paths（call_edge=false）、L3/L4 与工作根进程：
+python3 "$REPO_ROOT/scripts/verify_step7.py" \
+  --work-root "$WORK_MANUAL" \
+  --work-root /tmp/fa-manual-si \
+  --work-root /tmp/fa-manual-rf \
+  --check-procs
+
+# 若需用 pgrep 检查残留进程，务必按当前工作根路径过滤，避免误杀同机其他无关实验：
+pgrep -af "$WORK_MANUAL" || true
+```
+
 ---
 
-### Step 8：运行受控 Pi Agent 两段闭环（无模型对照 `--mode offline` 与真实 LLM `--mode real`）
+### Step 8：运行受控三臂实验（`B0` 基线、`--mode offline`、`--mode real`）
 
-**目的**：在验证底层机制无误后，用 TypeScript `Mcup2imCampaign` 状态机比较**“无模型切片骨架（offline）”**与**“大模型提案闭环（real）”**的行为、成本与发现效果。
+**目的**：在严格隔离的短路径 `--work-root` 下，使用同口径状态机比较 **`b0`（纯原版 P2IM 单段连续）**、**`offline`（无模型切片骨架）** 与 **`real`（大模型提案闭环）** 的端到端墙钟、`execs_done`、统一 BBL 并集覆盖率与 `L1–L5` 发现效果。
+
+> **工作区防撞（必须独立 `--work-root`）**：切勿让不同臂复用同一个 `work_root`，否则第二轮命中 `ORACLE_REFUSED: segment output directory is not empty`；且 `configs/m3/*.json` 里默认共享 `$P2IM_WORK_ROOT`。请直接向 CLI 传入 `--work-root` 覆盖（例如 `/tmp/fa-b0`、`/tmp/fa-off`、`/tmp/fa-r1`）。
+> **同墙钟 / 同执行次数双预算与配对种子**：
+> - **同端到端探索墙钟（`--fuzz-budget-s 1200`）**：`b0` 单段跑满 `1200s`；`offline` / `real` 先跑 `seg1`（如 `--segment-seconds 300`），扣除 `slice + analyze_and_propose` 真实耗时后将剩余秒数分配给 `seg2`（若剩余不足 `15s` 则显式记 `SEG2_SKIPPED_WALL_BUDGET` 并将状态标为 `partial`，绝不静默伪装 `completed`）；事后覆盖率重放 `bbl-coverage` 在 `end_to_end_wall_ms` 冻结之后独立统计于 `eval_coverage_wall_ms`，不污染三臂墙钟对比。
+> - **同目标执行次数（`--max-execs N`）**：可选传入 `--max-execs N` 让 `b0` 与两段模式按相同总 `execs_done` 上限停机。
+> - **配对随机种子与重试累计（`--seed` / `--resume` / `--parent-out`）**：多轮独立试验传入 `--seed 1707`（`2707`、`3707`）使同轮三臂共享完全一致的确定性初始种子；中断恢复传 `--resume <attempt_id>`，跨目录重跑传 `--parent-out <prev_run_dir>` 自动累计前序请求、Token、墙钟与执行次数（`cumulative_cost`）。
+> - **默认配置冻结**：`real` 模式默认 `max_tokens = 160000`、`max_output_tokens = 16384`、`wall_ms = 3600000`、`analyze_model_calls = 6`、`--thinking low`、`--replay-model-calls 0`（确定性宿主重放，可传 `--replay-model-calls 2` 做消融）、`--inherit-queue-s2 true`。
+
+#### 8.0 纯原版 P2IM 单段基线臂：`--mode b0`（`model_requests = 0`）
+
+```bash
+cd "$REPO_ROOT"
+node dist/src/cli.js mcu-p2im \
+  --config configs/m3/plc.json \
+  --work-root /tmp/fa-b0 \
+  --out /tmp/runs/plc-b0 \
+  --mode b0 \
+  --fuzz-budget-s 1200 --seed 1707 \
+  --collect-coverage true
+
+# 产出：score-owned.json（含 stage_wall_ms、total_execs_done、coverage）与
+# l5-candidates-bare.json（纯原版 P2IM 裸结果，无共享 SRAM 切片）/ l5-candidates.json（同套离线 SRAM 切片归因）
+```
 
 #### 8.1 消融对照臂：`--mode offline`（`model_requests = 0`）
 
@@ -514,10 +585,13 @@ python3 "$REPO_ROOT/tools/p2im_oracle.py" fuzz --target Reflow_Oven --segment s1
 cd "$REPO_ROOT"
 node dist/src/cli.js mcu-p2im \
   --config configs/m3/plc.json \
+  --work-root /tmp/fa-off \
   --out /tmp/runs/plc-offline \
-  --mode offline
+  --mode offline \
+  --segment-seconds 300 --fuzz-budget-s 1200 --seed 1707 \
+  --collect-coverage true
 
-# 核对：status="completed", totals.model_calls=0, 并产出 L1..L4 与 l5-candidates.json
+# 核对：status="completed", totals.model_calls=0, 并产出 L1..L4、coverage 与两份 l5-candidates*.json
 cat /tmp/runs/plc-offline/score-owned.json
 ```
 
@@ -528,29 +602,34 @@ cat /tmp/runs/plc-offline/score-owned.json
 ```bash
 read -rsp "DEEPSEEK_API_KEY: " DEEPSEEK_API_KEY && export DEEPSEEK_API_KEY && echo
 
-# 若希望与线下试验隔离，可新建干净短路径 configs 副本（例：将 work_root 设为 /tmp/fa-r1）
 node dist/src/cli.js mcu-p2im \
   --config configs/m3/plc.json \
+  --work-root /tmp/fa-r1 \
   --out /tmp/runs/plc-real-r1 \
   --mode real \
+  --segment-seconds 300 --fuzz-budget-s 1200 --seed 1707 \
   --provider deepseek --model deepseek-v4-flash \
-  --model-calls 16 --max-total-tokens 150000 --wall-ms 1200000
+  --thinking low --max-output-tokens 16384 --analyze-model-calls 6 \
+  --replay-model-calls 0 \
+  --model-calls 16 --max-total-tokens 160000 \
+  --collect-coverage true
 ```
 
 运行结束后的关键核验项：
-1. `/tmp/runs/plc-real-r1/state.json`：`status === "completed"`，各阶段按序完成；
-2. `/tmp/runs/plc-real-r1/account.json` 与 `ledger.jsonl`：核验每笔模型请求均为 `settled`、总 `tokens` 与 `wall_ms`；
-3. `/tmp/runs/plc-real-r1/l5-candidates.json`：核验 `admitted_seeds` 记有 `crc_checked` 与字节长度，`candidates` 中的崩溃若命中 `HAL_UART_RxCpltCallback`，其 `via_shared_global` 与 `upstream_functions`（`Modbus::process_FC1`、`Modbus::process_FC3`）由宿主切片关联生成，与真值无关。
+1. `/tmp/runs/plc-real-r1/state.json`：`status === "completed"`、`work_dir === "/tmp/fa-r1/plc"`、`model_diagnostics.thinking === "low"`、`model_diagnostics.analyze_length_truncations === 0` 且 `warnings` 为空（若因 `stop_reason === "length"` 导致 0 种子，会显式告警 `ANALYZE_TRUNCATED_ZERO_SEEDS`）；
+2. `/tmp/runs/plc-real-r1/account.json` 与 `ledger.jsonl`：核验每笔模型请求均为 `settled`、`triage_mode` 为 `host_deterministic`、总 `tokens` 与 `stage_wall_ms`；
+3. `/tmp/runs/plc-real-r1/l5-candidates.json`：核验 `admitted_seeds` 记有 `crc_checked` 与字节长度，候选已按崩溃点去重并附带 `bbl_range` 与 `witness_count`；同时 `/tmp/fa-r1/plc/inputs-s2/` 包含短命名继承队列（`q0000*`）与提案种子（`p00*`），完整溯源映射见 `/tmp/fa-r1/plc/evidence/inputs-s2-map.json`。
 
 ---
 
-### Step 9：盲测隔离的宿主离线 `L5` 计分与论文级对照实验协议
+### Step 9：盲测隔离的宿主离线 `L5` 计分与论文级三臂对比评估
 
 #### 9.1 在所有 Agent 会话完全终止后运行离线 `L5` 与防泄漏审计
 
 ```bash
 NOTES="$HOEDUR_EXPERIMENTS_ROOT/02-coverage-est-data-set/binary-patching/P2IM_patching_notes.md"
 
+# 1) 对单次运行做 L5 评分（同时输出 bare_without_sram_slice 与 with_shared_sram_slice 双口径）
 python3 "$REPO_ROOT/scripts/score_l5.py" \
   --notes "$NOTES" \
   --candidates /tmp/runs/plc-real-r1/l5-candidates.json \
@@ -558,31 +637,48 @@ python3 "$REPO_ROOT/scripts/score_l5.py" \
   --summary-only \
   --out /tmp/runs/plc-real-r1/l5.json
 
+# 2) 防泄漏审计：务必传入与该次运行一致的 --work-dir（或省略 --work-dir 由 --candidates 里的 work_dir 自动定位）
 python3 "$REPO_ROOT/scripts/leak_check.py" \
-  --work-dir "$P2IM_WORK_ROOT/plc" \
+  --work-dir /tmp/fa-r1/plc \
   --candidates /tmp/runs/plc-real-r1/l5-candidates.json \
   --out /tmp/runs/plc-real-r1/leak-check.json
 
+# 3) 如运行未传 --collect-coverage true，也可事后对工作区离线提取统一唯一基本块并集覆盖率（BBL(s1) ∪ BBL(s2) vs BBL(B0)）
+python3 "$REPO_ROOT/tools/p2im_oracle.py" bbl-coverage --target PLC --work-root /tmp/fa-r1
+
+# 4) 同口径三臂对比（拆开报告 B0 裸结果 vs B0+静态切片 vs offline vs real，并给出同墙钟与同 execs_done 口径、raw/中位数/离散区间与成对 BBL 差集）
+python3 "$REPO_ROOT/scripts/eval_arms.py" compare \
+  --arm b0=/tmp/runs/plc-b0 \
+  --arm offline=/tmp/runs/plc-offline \
+  --arm real=/tmp/runs/plc-real-r1 \
+  --notes "$NOTES" \
+  --out /tmp/runs/plc-compare.json \
+  --markdown /tmp/runs/plc-compare.md
+
 cat /tmp/runs/plc-real-r1/l5.json
 cat /tmp/runs/plc-real-r1/leak-check.json
+cat /tmp/runs/plc-compare.md
 ```
 
 期望验收标准：
-- `leak-check.json`：`"leak_in_prompt": false`、`"total_hits": 0`、`missing` 为空；
-- `l5.json`：准确统计 `known_p2im_bug_direct`、`known_p2im_bug_downstream`、`unmatched_verified_candidate`，同时**不打印原始补丁文本**，仅输出真值 SHA256 与标题/函数命中诊断。
+- `leak-check.json`：`"work_dir": "/tmp/fa-r1/plc"`、`"leak_in_prompt": false`、`"total_hits": 0`、`missing` 为空（`leak_check.py` 会自动同扫同目录 `ledger.jsonl` 与工具定义源码，若显式 `--work-dir` 与 `candidates.work_dir` 不一致则以退出码 `2` 拒绝）；
+- `l5.json`（`mcu-p2im/l5-0.4`）：同时输出按唯一缺陷 ID 去重的 `unique_bugs`（`unique_known_bugs_direct`、`unique_known_bugs_downstream`、`unique_known_bugs_total`、`matched_bug_ids`）与候选计数 `counts`、`attribution_split`（`bare_without_sram_slice` vs `with_shared_sram_slice` vs `sram_slice_net_gain`），且 `"raw_text_emitted": false`；
+- `plc-compare.json` / `plc-compare.md`：以唯一已知缺陷数（`unique_bugs`）作为 `L5` 主指标，明确区分四条归因口径、同端到端墙钟与执行次数效率视角（若需严格同 `execs_done` 对照则运行期加 `--max-execs N`），以及统一 `unique_bbls_union` 并集覆盖率。
 
 #### 9.2 正式论文级对照实验设计准则（三臂对照 & 统计口径）
 
 若要将本框架用于发表级对比评估，请遵循以下严格准则：
-1. **保留三臂完整对照**：
-   - **`B0`（纯 P2IM 单段 AFL）**：使用同版 Round 0 模型与相同双初始种子（仅靠 Step 7 `prepare → me → fuzz` 单段跑满总墙钟）；
-   - **`--mode offline`（无 Agent 对照臂）**：保留相同的分段、静态/共享 SRAM 切片、3 次重放与 Contrast 验证，但 `model_calls = 0`（用于分离“框架自身工效”与“大模型推理收益”）；
-   - **`--mode real`（FirmAgent-P2IM 完整臂）**：开启 Pi 受控分析与 `seed_propose` 引导第二段探索。
-2. **双时间预算口径分开报告**：
+1. **保留三臂完整对照并拆开静态切片归因**：
+   - **`B0` 裸基线（`--mode b0` + `l5-candidates-bare.json`）**：纯原版 P2IM 单段 AFL，不计入共享 SRAM 切片归因；
+   - **`B0 + 离线共享 SRAM 切片`（`--mode b0` + `l5-candidates.json`）**：将同套静态/共享 SRAM 切片仅作为离线归因工具叠加到 `B0`，用于独立剥离切片模块净收益；
+   - **`--mode offline`（两段无 Agent 对照臂）**：保留分段（`s2` 默认继承 `s1` 队列）、切片、`L3/L4` 验证，但 `model_calls = 0`；
+   - **`--mode real`（FirmAgent-P2IM 完整臂）**：开启 Pi 受控分析与 `seed_propose` 引导 `s2` 探索（亦可设 `--inherit-queue-s2 false` 消融冷重启）。
+2. **统一覆盖率与双时间预算口径分开报告**：
+   - 覆盖率采用 `tools/p2im_oracle.py bbl-coverage` 基于 QEMU `-trace` 提取的**唯一基本块并集**（`BBL(s1) ∪ BBL(s2)` vs `BBL(B0)`），禁止将分段 AFL `paths_total` 直接相加；
    - **同端到端墙钟对比**：保证 `B0` 单段总时长等于 `mcu-p2im` 的全流程墙钟（包含切片、LLM 推理往返与重放开销）；
-   - **同目标执行次数对比**：另行比较相同 `execs_done` 预算下的 `paths_total` 与 `L3/L4/L5` 产出。
-3. **跨目标禁止直接比大小**：裸机 MCU 分属四套芯片/外设模型（STM32F429、STM32F103、K64F、SAM3X8E），绝不跨不同目标对比 `execs_done` 或覆盖数绝对值；仅在同一固件内部做配对比较。
-4. **多随机种子独立工作根与完整分布汇报**：至少独立运行 3 次（初筛 3 轮，正式评估按试跑方差冻结更多独立种子，每轮重建全新 `--work-root` 清空语料与模型缓存），论文表格须同时列出**单次原始值、中位数与离散区间**，并单列模型请求次数、Token 总量与计费口径（不可仅汇报 3 次均值）。
+   - **同目标执行次数对比**：另行比较相同 `execs_done` 预算（及 `per 1k execs`）下的 `unique_bbls_union` 与 `L3/L4/L5` 产出。
+3. **跨目标禁止直接比大小**：裸机 MCU 分属四套芯片/外设模型（STM32F429、STM32F103、K64F、SAM3X8E），绝不跨不同目标对比 `execs_done` 或覆盖数绝对值；仅在同一固件内部做配对比较（`scripts/eval_arms.py compare` 会自动拒绝跨目标混比）。
+4. **多随机种子独立工作根与完整分布汇报**：至少独立运行 3 次（初筛 3 轮，正式评估按试跑方差冻结更多独立种子，每轮重建全新 `--work-root` 清空语料与模型缓存），可向 `scripts/eval_arms.py compare` 重复传入多次 `--arm real=<dir>`，论文表格须同时列出**单次原始值、中位数与离散区间**，并单列 `provider`/`model`/`thinking` 档位、模型请求次数、Token 总量与计费口径（不可仅汇报 3 次均值）。
 
 ---
 
@@ -599,8 +695,9 @@ cat /tmp/runs/plc-real-r1/leak-check.json
 | `$P2IM_WORK_ROOT/<slug>/analysis/{sources,paths}.json` | `oracle extract-sources / slice-paths` | 全轮 DR 读点、`via_shared_global` 与 `indexed_reach`（`call_edge: false`） |
 | `$P2IM_WORK_ROOT/<slug>/proposed-seeds/` | `oracle admit-seed` | 经过长度、防泄漏与 CRC16 校验的模型提案种子 |
 | `<out>/{state,account,score-owned}.json` | `mcu-runtime.ts` | 状态机流转、逐笔模型/Token 账本、`L1–L4` 验证分层 |
-| `<out>/l5-candidates.json` | `mcu-runtime.ts` | 送往离线评分的确定性崩溃列表及上游共享全局候选 |
-| `<out>/l5.json` & `leak-check.json` | `score_l5.py` / `leak_check.py` | 宿主事后离线 `L5` 三分类统计与真值防泄漏审计 |
+| `<out>/l5-candidates.json` & `l5-candidates-bare.json` | `mcu-runtime.ts` | 送往离线评分的确定性崩溃列表（分别含共享 SRAM 上游候选与裸崩溃口径） |
+| `<out>/l5.json`, `leak-check.json`, `arm-summary.json` | `score_l5.py` / `leak_check.py` / `eval_arms.py` | 宿主事后离线 `L5` 双归因统计、防泄漏审计与三臂对比汇总 |
+| `$P2IM_WORK_ROOT/<slug>/analysis/bbl-coverage.json` | `oracle bbl-coverage` | 基于 QEMU `-trace` 的跨段唯一基本块并集覆盖率（`BBL(s1) ∪ BBL(s2)`） |
 
 ### 3.2 真实环境常见故障速查表
 
@@ -614,4 +711,4 @@ cat /tmp/runs/plc-real-r1/leak-check.json
 | `All test cases time out or crash, giving up!` | 宿主 `core_pattern` 为管道模式或缺少 `seed-short` | 执行 `echo core \| sudo tee /proc/sys/kernel/core_pattern` 且保留 `inputs/seed-short` |
 | `me.py` 报 `killall: not found` | 系统缺 `psmisc` 包 | `sudo apt-get install -y psmisc` |
 | `DEEPSEEK` 请求提示认证失败或未找到模型 | 未注入环境变量或自定义端点别名缺失 | 用 `read -rsp` 导出 `DEEPSEEK_API_KEY`；先用 `node dist/src/cli.js doctor` 验证解析 |
-| `npm run verify:privacy` 命中报警 | 暂存目录混入 `runs/`、`node_modules/`、`dist/` 或私钥 | 清理临时构建与运行产物目录，确认 `hits=0` 再提交 Git |
+| `npm run verify:privacy` 命中构建目录 | 构建后才运行发版前洁净检查（包含 `node_modules/`、`dist/`） | **不要删除构建产物**；洁净检查在 `npm ci` 前运行，构建后改用 `python3 scripts/privacy_audit.py --ignore-build-artifacts` |

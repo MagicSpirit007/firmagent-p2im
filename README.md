@@ -26,10 +26,10 @@
 
 | Problem / Bottleneck | Mechanism Introduced (File / Symbol) | Observable Before -> After |
 |---|---|---|
-| Stock `RiS3-Lab/p2im` (`0e64506a`) fails on Ubuntu 24.04 / Python 3.12 (`SafeConfigParser` removed, 2017 `libglib` mismatch, `killall` missing, WSL2 AFL checks) | `patches/p2im-python312-scripts.patch` (`ConfigParser(inline_comment_prefixes=...)`), `p2im-shim/wsl_compat.py`, `unset LD_LIBRARY_PATH` QEMU shim, `<100B` path preflight (`tools/p2im_oracle.py`, `scripts/generate_configs.py`) | **Before**: Immediate import/link aborts or container dry-run rejections<br>**After**: Deterministic builds, `0`-stray process sweeps, verified offline tests (`24/24` with mounted truth/ELFs) |
+| Stock `RiS3-Lab/p2im` (`0e64506a`) fails on Ubuntu 24.04 / Python 3.12 (`SafeConfigParser` removed, 2017 `libglib` mismatch, unscoped `killall`, WSL2 AFL checks, `<100B` `-c` abort on `s2` seeds) | `patches/p2im-python312-scripts.patch` (`ConfigParser`, `--model-if` continuity, `--skip-seed-prefix`, scoped cleanup), `p2im-shim/wsl_compat.py`, `unset LD_LIBRARY_PATH` QEMU shim, `<100B` short `inputs-s2` mapping (`b00`/`q0000`/`p00`) | **Before**: Immediate import/link aborts, `s2` `MODEL_IF_LEN=100` `PROGRAM ABORT`, or model resets<br>**After**: Deterministic builds, cumulative `0.s2` model continuity, `0`-stray process sweeps, verified offline TS + Python suites |
 | Unpatched `Soldering_Iron.elf` (`44a6f0e3…`) has `0` `svc #0x3f` calls, so stock QEMU never starts AFL forkserver | Opt-in `p2im_maybe_auto_forkserver` gated by `P2IM_AUTO_FORKSERVER_PC=0x08000268` (`target-arm/translate.c`, `cpu-exec.c`); no-op when unset | **Before**: `0` models, `p2im_runnable=false` (9/10 targets)<br>**After**: Zero ELF edits; `Soldering_Iron` hits `start up afl forkserver!` (`13` peripherals, `33` DR, `60.066s` fuzz window) |
-| Corrupted callback pointers jumping into MMIO (`0x40000000..0x5fffffff`) trigger bogus unmodeled-peripheral retries (`0x40`); wrong `CNC` board or 256B `Reflow_Oven` dry-run aborts | `PM_EXEC_PERI = 0x72` guard + `pm_fetching_code` (`cputlb.c`, `memory.c`) + `no_retry`; lock `CNC` to `STM32F429I-Discovery`; dual `seed-short` (`0\n\x00\x00`) beside `seed-random` | **Before**: `me.py` retry loops; `CNC` `0` DR (`-11`); `Reflow_Oven` `0` execs `PROGRAM ABORT`<br>**After**: Clean `0x72` exit with register trace; `CNC` `39` DR (`2926` execs/60s); `Reflow_Oven` `2582` execs/60s |
-| ISR-to-main communication crosses global SRAM buffers (`slave` -> `rx_callback`) without a direct call edge; downstream callback crashes obscure upstream root causes | `DISASM_PARSER_VERSION = 3` (`add` mnemonic + literal pools), `indexed_member_sites` / `indexed_reach` (`call_edge: false`), `sharedViaRank` (`mcu-runtime.ts`), `admit-seed` CRC16 gate, offline `score_l5.py` (`## <Firmware>` fix) | **Before**: Missing `Modbus::process_FC1` upstream link (`L5 downstream=0`); `score_l5.py` ignored `## PLC`<br>**After**: `PLC` attributes downstream crash in `HAL_UART_RxCpltCallback` to `Modbus::process_FC1` (`L5 downstream=2` with `0` truth leakage) |
+| Corrupted callback pointers jumping into MMIO (`0x40000000..0x5fffffff`) trigger bogus unmodeled-peripheral retries (`0x40`); wrong `CNC` board or 256B `Reflow_Oven` dry-run aborts | `PM_EXEC_PERI = 0x72` guard + `pm_fetching_code` (`cputlb.c`, `memory.c`) + `no_retry` + `exec_peri` crash replay parser; lock `CNC` to `STM32F429I-Discovery`; dual `seed-short` (`0\n\x00\x00`) beside `seed-random` | **Before**: `me.py` retry loops; `CNC` `0` DR (`-11`); `Reflow_Oven` `0` execs `PROGRAM ABORT`<br>**After**: Deterministic `0x72` crash capture; `CNC` `39` DR (`2926` execs/60s); `Reflow_Oven` `2582` execs/60s |
+| ISR-to-main communication crosses global SRAM buffers (`slave` -> `rx_callback`) without a direct call edge; downstream callback crashes obscure upstream root causes | `DISASM_PARSER_VERSION = 3` (`add` mnemonic + literal pools), `indexed_member_sites` / `indexed_reach` (`call_edge: false`), `sharedViaRank` (`mcu-runtime.ts`), `admit-seed` CRC16 gate, 5-target ELF-backed `score_l5.py` (`unique_bugs` deduplication) | **Before**: Missing `Modbus::process_FC1` upstream link; blind `L5` on inline-formatted targets (`CNC`/`Heat_Press`/`Soldering_Iron`)<br>**After**: Full 5-target (12-bug) truth resolution, `L2>=L3>=L4` fingerprint deduplication, and `unique_bugs` deduplicated `L5` attribution (`0` truth leakage) |
 
 ---
 
@@ -76,9 +76,9 @@ All 10 unpatched binaries are fetched from upstream public repositories and veri
 To inspect every change and verify each component without black-box wrappers, follow **Steps 1–9** in [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md):
 - **Steps 1–2**: Install host packages (`psmisc`, `binutils-arm-none-eabi`, `libjansson-dev`, Node `>=22.19.0`), configure `/proc/sys/kernel/core_pattern`, check out pinned `RiS3-Lab/p2im@0e64506a`, `p2im-real_firmware@d4c74565`, and `hoedur-experiments@2babc78b`, verify all 10 ELF SHA256 digests, and compare `svc 0x3f` counts via `arm-none-eabi-objdump`.
 - **Steps 3–5**: Manually compile `afl-fuzz`, inspect (`git apply --stat`) and apply the 16-file QEMU patch, check the `CONFIG_STM32=y` / `CONFIG_KINETIS=n` invariant, build `qemu-system-gnuarmeclipse` with `-ljansson` & `nm` verification (`T p2im_maybe_auto_forkserver`), apply `p2im-python312-scripts.patch` + `wsl_compat.py` + `me` wrapper, and generate `configs/m3/*.json`.
-- **Step 6**: Build TypeScript (`npm ci && npm run build`), run TS/Python contract suites (`npm test`, `npm run test:py`), run `npm run verify:privacy`, and verify provider setup via read-only `node dist/src/cli.js doctor`.
-- **Step 7 (Low-Level Dissection)**: Drive `tools/p2im_oracle.py` manually command-by-command (`prepare` -> `smoke` -> `me` -> `fuzz` -> `extract-sources` -> `slice-paths` -> `admit-seed` negative/positive CRC16 examples -> `crashes` -> `replay --repeat 3` -> `contrast` -> optional `gdb-watch`), plus side-by-side manual verification of `Soldering_Iron` (`--auto-forkserver-pc 0x08000268`) and `Reflow_Oven` (`seed-short`).
-- **Steps 8–9**: Run controlled `--mode offline` (`model_calls=0`) vs `--mode real` (`DEEPSEEK_API_KEY`) campaigns, then evaluate offline isolated `score_l5.py` + `leak_check.py` under the three-arm (`B0` vs `offline` vs `real`) equal-wall-clock / equal-`execs_done` protocol.
+- **Step 6**: Run the pre-build clean privacy gate (`npm run verify:privacy`), install & build TypeScript (`npm ci && npm run build`), run TS/Python contract suites (`npm test`, `npm run test:py`), optionally re-scan secrets (`python3 scripts/privacy_audit.py --ignore-build-artifacts`), and verify provider setup via read-only `node dist/src/cli.js doctor`.
+- **Step 7 (Low-Level Dissection)**: Drive `tools/p2im_oracle.py` manually command-by-command (`prepare` -> `smoke` -> `me` -> `fuzz` -> `extract-sources` -> `slice-paths` -> `admit-seed` negative/positive CRC16 examples -> `crashes` -> `replay --repeat 3` -> `contrast` -> optional `gdb-watch`), inspect via `scripts/verify_step7.py`, plus side-by-side manual verification of `Soldering_Iron` (`--auto-forkserver-pc 0x08000268`) and `Reflow_Oven` (`seed-short`).
+- **Steps 8–9**: Run controlled `--mode b0` (single-segment stock P2IM), `--mode offline` (`model_calls=0`), and `--mode real` (`DEEPSEEK_API_KEY`, `--thinking low --max-output-tokens 16384 --analyze-model-calls 6 --replay-model-calls 0`) campaigns with isolated `--work-root`s, then evaluate offline isolated `score_l5.py` + `leak_check.py` + `eval_arms.py compare` under the equal-wall-clock / equal-`execs_done` & unique BBL union protocol.
 
 ### Route B: 5-Step Automated Quickstart (`scripts/setup_upstreams.sh` Wrapper for Steps 1–5)
 
@@ -97,34 +97,37 @@ To inspect every change and verify each component without black-box wrappers, fo
    cd ~/firmagent-p2im
    bash scripts/setup_upstreams.sh
    ```
-3. **Install Node dependencies, compile TypeScript, and run offline verification + privacy audit**:
+3. **Run pre-build clean privacy gate, install Node dependencies, compile TypeScript, and run offline verification**:
+   > Run `npm run verify:privacy` **before** `npm ci` (and do NOT delete `node_modules/` or `dist/` afterward; post-build secret scanning uses `--ignore-build-artifacts`).
    ```bash
+   npm run verify:privacy
    npm ci && npm run build
    npm test
-   P2IM_ROOT="$HOME/deps/p2im" P2IM_NOTES="$HOME/deps/hoedur-experiments/02-coverage-est-data-set/binary-patching/P2IM_patching_notes.md" npm run test:py
-   npm run verify:privacy
+   P2IM_ROOT="$HOME/deps/p2im" HOEDUR_EXPERIMENTS_ROOT="$HOME/deps/hoedur-experiments" P2IM_NOTES="$HOME/deps/hoedur-experiments/02-coverage-est-data-set/binary-patching/P2IM_patching_notes.md" npm run test:py
+   python3 scripts/privacy_audit.py --ignore-build-artifacts
    ```
-4. **Run zero-LLM baseline (`B0` stock P2IM segment or `--mode offline` full `L1–L4` loop)**:
+4. **Run zero-LLM baselines (`--mode b0` stock P2IM or `--mode offline` full `L1–L4` loop) under equal `--fuzz-budget-s 1200` and paired `--seed 1707` with isolated `--work-root`s**:
    ```bash
-   python3 tools/p2im_oracle.py prepare --target PLC \
-     --elf "$HOME/deps/p2im/externals/p2im-real_firmware/binary/PLC" \
-     --expect-sha256 783108cf8b9cf7f703a4164dfee7d12d9a9f79d663328a21454a70a7003c2b08 \
-     --work-root /tmp/fa-p2im-b0
-   python3 tools/p2im_oracle.py me --target PLC --round 0 --work-root /tmp/fa-p2im-b0
-   python3 tools/p2im_oracle.py fuzz --target PLC --segment s1 --seconds 60 --work-root /tmp/fa-p2im-b0
-   # Or run full TypeScript offline pipeline (model_requests = 0):
-   node dist/src/cli.js mcu-p2im --config configs/m3/plc.json --out runs/plc-offline --mode offline
+   node dist/src/cli.js mcu-p2im --config configs/m3/plc.json --work-root /tmp/fa-b0 --out runs/plc-b0 --mode b0 --fuzz-budget-s 1200 --seed 1707 --collect-coverage true
+   node dist/src/cli.js mcu-p2im --config configs/m3/plc.json --work-root /tmp/fa-off --out runs/plc-offline --mode offline --segment-seconds 300 --fuzz-budget-s 1200 --seed 1707 --collect-coverage true
    ```
-5. **Run with DeepSeek LLM + offline post-hoc `L5` scoring**:
+5. **Run with DeepSeek LLM + offline post-hoc `L5` & multi-arm evaluation**:
    ```bash
    read -rsp "DEEPSEEK_API_KEY: " DEEPSEEK_API_KEY && export DEEPSEEK_API_KEY && echo
    node dist/src/cli.js doctor --provider deepseek --model deepseek-v4-flash
-   node dist/src/cli.js mcu-p2im --config configs/m3/plc.json --out runs/plc-real --mode real \
-     --provider deepseek --model deepseek-v4-flash --model-calls 16 --max-total-tokens 150000
-   # After the run completes, score L5 in a separate offline process:
+   node dist/src/cli.js mcu-p2im --config configs/m3/plc.json --work-root /tmp/fa-real --out runs/plc-real --mode real \
+     --segment-seconds 300 --fuzz-budget-s 1200 --seed 1707 \
+     --provider deepseek --model deepseek-v4-flash --thinking low \
+     --max-output-tokens 16384 --analyze-model-calls 6 --replay-model-calls 0 \
+     --model-calls 16 --max-total-tokens 160000 --collect-coverage true
+   # After all Agent sessions exit, score deduplicated unique L5 bugs and compare B0 (bare vs +SRAM slice) vs offline vs real:
    python3 scripts/score_l5.py \
      --notes "$HOME/deps/hoedur-experiments/02-coverage-est-data-set/binary-patching/P2IM_patching_notes.md" \
      --candidates runs/plc-real/l5-candidates.json --target PLC --summary-only --out runs/plc-real/l5.json
+   python3 scripts/eval_arms.py compare \
+     --arm b0=runs/plc-b0 --arm offline=runs/plc-offline --arm real=runs/plc-real \
+     --notes "$HOME/deps/hoedur-experiments/02-coverage-est-data-set/binary-patching/P2IM_patching_notes.md" \
+     --markdown runs/plc-compare.md
    ```
 
 For design rationales, Before/After evidence, multi-seed evaluation protocols, troubleshooting, and artifact schemas, read:
@@ -155,9 +158,11 @@ firmagent-p2im/
 ├── scripts/
 │   ├── setup_upstreams.sh               # Automated pinned fetch, compile, patch, ELF SHA256 verify & config gen
 │   ├── generate_configs.py              # Emits configs/m3/<target>.json with <100B -c check
-│   ├── score_l5.py                      # Offline L5 scorer (direct / downstream / unmatched)
+│   ├── verify_step7.py                  # Read-only Step 7 oracle workspace health verifier
+│   ├── score_l5.py                      # Offline L5 scorer (direct / downstream / unmatched + bare vs SRAM split)
+│   ├── eval_arms.py                     # Offline B0 vs offline vs real evaluator & multi-run comparator
 │   ├── leak_check.py                    # Blind-test token scanner
-│   └── privacy_audit.py                 # Pre-publish secret/path hygiene scanner
+│   └── privacy_audit.py                 # Pre-publish secret/path hygiene scanner (prunes build dirs)
 ├── configs/pi-agent-example/models.json # Non-secret DeepSeek endpoint template
 ├── docs/
 │   ├── P2IM_10_UNPATCHED_MANIFEST.json  # Verified metadata & SHA256 digests for all 10 ELF targets

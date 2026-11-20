@@ -23,7 +23,7 @@ This guide explains how and why `patches/p2im-qemu-auto-forkserver.patch` patche
 - **Target list**: Always build `--target-list=gnuarmeclipse-softmmu` (NOT `arm-softmmu`).
 - **Board config invariant**: Keep `default-configs/gnuarmeclipse-softmmu.mak` with `CONFIG_STM32=y` and `CONFIG_KINETIS=n` / `CONFIG_LPC=n` / `CONFIG_TIVA=n` / `CONFIG_XMC=n` / `CONFIG_SAM=n`. P2IM registers `FRDM-K64F` and `Arduino-Due` inside `stm32-boards.c`; enabling `CONFIG_KINETIS=y` registers `FRDM-K64F` twice and aborts QEMU on startup.
 - **Avoid 2017 bundled `libglib-2.0.so.0.5100.0`**: When invoking a modern-host-compiled `qemu-system-gnuarmeclipse`, do NOT put upstream P2IM's precompiled 2017 `qemu/*.so` directory on `LD_LIBRARY_PATH`, or dynamic linking fails with `undefined symbol: g_string_free_and_steal`. The `tools/p2im_oracle.py` wrapper shim explicitly runs `unset LD_LIBRARY_PATH`.
-- **Jansson development library**: Ensure `libjansson-dev` (`jansson.h` + `-ljansson`) is installed so `config-host.mak` links cleanly.
+- **Jansson development library**: Ensure `libjansson-dev` (`jansson.h` + `-ljansson`) is installed and `-ljansson` appears in `LIBS` (at the tail of the link command) inside `config-host.mak`. On Ubuntu 24.04 (`ld --as-needed`), passing `-ljansson` via `--extra-ldflags` alone puts it into `LDFLAGS` *before* object files, where the linker drops it and fails with `undefined reference to json_array_get` / `json_unpack_ex`. Checking `^LIBS` (not a bare `grep -q 'ljansson'`) ensures `LIBS+=-ljansson` is appended cleanly.
 
 ## Manual Out-of-Tree Build Commands
 
@@ -32,26 +32,25 @@ export P2IM_ROOT="${P2IM_ROOT:-$HOME/deps/p2im}"
 export P2IM_TOOLS_ROOT="${P2IM_TOOLS_ROOT:-$HOME/p2im-tools}"
 export QEMU_BUILD_DIR="${QEMU_BUILD_DIR:-$HOME/deps/p2im-qemu-build}"
 
-git -C "$P2IM_ROOT" apply --directory=qemu/src/qemu.git patches/p2im-qemu-auto-forkserver.patch
-
-mkdir -p "$QEMU_BUILD_DIR" && cd "$QEMU_BUILD_DIR"
-"$P2IM_ROOT/qemu/src/qemu.git/configure" \
-  --prefix="$QEMU_BUILD_DIR/install" \
-  --target-list=gnuarmeclipse-softmmu \
-  --python="$(command -v python3)" \
-  --disable-werror --disable-docs --disable-gtk --disable-sdl \
-  --disable-vnc --disable-xen --disable-kvm --disable-guest-agent \
-  --extra-cflags="$(pkg-config --cflags jansson 2>/dev/null || true)" \
-  --extra-ldflags="$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)"
-
-# Ensure -ljansson appears at the tail of LIBS in config-host.mak
-grep -q 'ljansson' config-host.mak || {
-  echo "QEMU_CFLAGS+=$(pkg-config --cflags jansson 2>/dev/null || true)" >> config-host.mak
-  echo "LIBS+=$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)" >> config-host.mak
-}
-
-make -j"$(nproc)"
+git -C "$P2IM_ROOT" apply --directory=qemu/src/qemu.git patches/p2im-qemu-auto-forkserver.patch && \
+mkdir -p "$QEMU_BUILD_DIR" && \
+(
+  cd "$QEMU_BUILD_DIR" && \
+  "$P2IM_ROOT/qemu/src/qemu.git/configure" \
+    --prefix="$QEMU_BUILD_DIR/install" \
+    --target-list=gnuarmeclipse-softmmu \
+    --python="$(command -v python3)" \
+    --disable-werror --disable-docs --disable-gtk --disable-sdl \
+    --disable-vnc --disable-xen --disable-kvm --disable-guest-agent \
+    --extra-cflags="$(pkg-config --cflags jansson 2>/dev/null || true)" \
+    --extra-ldflags="$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)" && \
+  { grep -qE '^LIBS[[:space:]]*\+?=.*-ljansson([[:space:]]|$)' config-host.mak || {
+    echo "QEMU_CFLAGS+=$(pkg-config --cflags jansson 2>/dev/null || true)" >> config-host.mak &&
+    echo "LIBS+=$(pkg-config --libs jansson 2>/dev/null || echo -ljansson)" >> config-host.mak
+  }; } && \
+  make -j"$(nproc)"
+) && \
 install -Dm755 "$QEMU_BUILD_DIR/gnuarmeclipse-softmmu/qemu-system-gnuarmeclipse" \
-  "$P2IM_TOOLS_ROOT/qemu/qemu-system-gnuarmeclipse"
-nm "$P2IM_TOOLS_ROOT/qemu/qemu-system-gnuarmeclipse" | grep 'p2im_maybe_auto_forkserver'
+  "$P2IM_TOOLS_ROOT/qemu/qemu-system-gnuarmeclipse" && \
+nm "$P2IM_TOOLS_ROOT/qemu/qemu-system-gnuarmeclipse" | grep ' T p2im_maybe_auto_forkserver'
 ```

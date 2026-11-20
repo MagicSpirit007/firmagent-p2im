@@ -38,7 +38,7 @@ export interface Mcup2imToolOptions {
 }
 
 function present(value: ToolEnvelope) {
-  assertNoLeak(JSON.stringify(value.observations) + JSON.stringify(value.metrics), value.tool);
+  assertNoLeak(JSON.stringify(value), value.tool);
   return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value };
 }
 

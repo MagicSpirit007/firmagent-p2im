@@ -19,8 +19,8 @@ Design rules that the TypeScript layer relies on:
 * strings that belong to the blind-test truth set (CVE ids, CWE ids, P2IM Table 5)
   are rejected rather than passed through.
 
-Subcommands: identify, prepare, smoke, me, fuzz, status, crashes, replay, contrast,
-extract-sources, slice-paths, admit-seed, gdb-watch, cleanup, aggregate.
+Subcommands: identify, identify-all, prepare, smoke, me, fuzz, status, crashes, replay, contrast,
+extract-sources, slice-paths, admit-seed, gdb-watch, cleanup, bbl-coverage, aggregate.
 """
 
 from __future__ import annotations
@@ -356,46 +356,61 @@ def _signal_group(pgid: int, sig: int) -> bool:
         return False
 
 
-def spawn_bounded(command, cwd, env, timeout_s, output_path, owned=None, label="run"):
-    """Run one command in its own session; on timeout signal the whole group.
+def spawn_bounded(command, cwd, env, timeout_s, output_path, owned=None, label="run", stop_when=None):
+    """Run one command in its own session; on timeout or stop_when signal the whole group.
 
     Returns (rc, timed_out, duration_s).  rc is None when the command never started.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    handle = open(output_path, "wb")
-    started = time.time()
-    try:
-        proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=handle, stderr=subprocess.STDOUT,
-                                start_new_session=True, stdin=subprocess.DEVNULL)
-    except OSError as exc:
-        handle.write(("spawn failed: %s\n" % exc).encode("utf-8"))
-        handle.close()
-        return None, False, 0.0
-    pgid = os.getpgid(proc.pid)
-    if owned is not None:
-        owned.register(pgid, label, command)
-    timed_out = False
-    try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _signal_group(pgid, signal.SIGINT)
+    started = time.monotonic()
+    with open(output_path, "wb") as handle:
         try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            _signal_group(pgid, signal.SIGKILL)
+            proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=handle, stderr=subprocess.STDOUT,
+                                    start_new_session=True, stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            handle.write(("spawn failed: %s\n" % exc).encode("utf-8"))
+            return None, False, 0.0
+        pgid = os.getpgid(proc.pid)
+        if owned is not None:
+            owned.register(pgid, label, command)
+        timed_out = False
+        stopped_early = False
+        if stop_when is None:
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                pass
-    rc = proc.returncode
-    # A surviving child that ignored SIGINT would still hold the group; sweep it.
-    if _alive(pgid):
-        _signal_group(pgid, signal.SIGKILL)
-    if owned is not None:
-        owned.forget(pgid)
-    handle.close()
-    return rc, timed_out, round(time.time() - started, 3)
+                timed_out = True
+        else:
+            deadline = started + max(0.1, float(timeout_s))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    proc.wait(timeout=min(0.5, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    if stop_when():
+                        stopped_early = True
+                        break
+        if timed_out or stopped_early:
+            _signal_group(pgid, signal.SIGINT)
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                _signal_group(pgid, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+        rc = proc.returncode
+        # A surviving child that ignored SIGINT would still hold the group; sweep it.
+        if _alive(pgid):
+            _signal_group(pgid, signal.SIGKILL)
+        if owned is not None:
+            owned.forget(pgid)
+    return rc, timed_out, round(time.monotonic() - started, 3)
 
 
 def tool_env(extra=None):
@@ -508,6 +523,29 @@ log_file    = {self.dir}/me.log
     def qemu_shim(self) -> str:
         return os.path.join(self.root, "bin", "qemu-system-gnuarmeclipse")
 
+    def qemu_target(self) -> str | None:
+        shim = self.qemu_shim()
+        if not os.path.isfile(shim):
+            return None
+        with open(shim, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+        match = re.search(r'^exec\s+"([^"]+)"\s+"\$@"\s*$', text, re.M)
+        return match.group(1) if match else None
+
+    def require_qemu(self, tools_root: str | None = None) -> str:
+        shim = self.qemu_shim()
+        if not os.path.isfile(shim) or not os.access(shim, os.X_OK):
+            fail(EXIT_REFUSED, "QEMU shim is missing or not executable: %s" % shim,
+                 shim=shim, hint="run: p2im_oracle.py prepare --target %s --elf <path>" % self.target)
+        real_qemu = self.qemu_target()
+        if not real_qemu and tools_root:
+            real_qemu = os.path.join(tools_root, "qemu", "qemu-system-gnuarmeclipse")
+        if not real_qemu or not os.path.isfile(real_qemu) or not os.access(real_qemu, os.X_OK):
+            fail(EXIT_REFUSED, "QEMU binary is missing or not executable: %s" % (real_qemu or shim),
+                 shim=shim, qemu=real_qemu,
+                 hint="build and install qemu-system-gnuarmeclipse into $P2IM_TOOLS_ROOT/qemu/")
+        return real_qemu
+
     def install_shim(self, real_qemu: str) -> str:
         shim = self.qemu_shim()
         os.makedirs(os.path.dirname(shim), exist_ok=True)
@@ -520,7 +558,11 @@ log_file    = {self.dir}/me.log
             "unset LD_LIBRARY_PATH\n"
             'exec "%s" "$@"\n' % real_qemu
         )
-        if not os.path.exists(shim) or open(shim).read() != body:
+        existing = None
+        if os.path.exists(shim):
+            with open(shim, "r", encoding="utf-8", errors="replace") as handle:
+                existing = handle.read()
+        if existing != body:
             with open(shim, "w", encoding="utf-8") as handle:
                 handle.write(body)
             os.chmod(shim, 0o755)
@@ -537,7 +579,14 @@ log_file    = {self.dir}/me.log
                 out.append(name)
         def sort_key(name):
             head = name.split(".")
-            return (int(head[0]), len(head), name)
+            major = int(head[0])
+            if major == 0 and len(head) > 1:
+                try:
+                    mtime = os.stat(os.path.join(self.dir, name, "peripheral_model.json")).st_mtime_ns
+                except OSError:
+                    mtime = 0
+                return (0, 1, mtime, name)
+            return (major, 0, 0, name)
         return sorted(out, key=sort_key)
 
     def latest_round(self):
@@ -707,16 +756,23 @@ def register_stride(value) -> int:
 
 
 def find_round_artifacts(work: Work, round_name: str, prefix: str):
-    """Every file under the round whose name starts with prefix, including depth:* subdirectories."""
-    directory = os.path.join(work.dir, round_name)
-    if not os.path.isdir(directory):
-        return []
+    """Every file under the round (or archived rounds) whose name starts with prefix, including depth:*."""
+    roots = [os.path.join(work.dir, round_name)]
+    archive_root = os.path.join(work.dir, "rounds-archive")
+    if os.path.isdir(archive_root):
+        for snap in sorted(os.listdir(archive_root)):
+            cand = os.path.join(archive_root, snap, round_name)
+            if os.path.isdir(cand):
+                roots.append(cand)
     found = []
-    for root, dirs, files in os.walk(directory):
-        dirs.sort()
-        for name in files:
-            if name.startswith(prefix):
-                found.append(os.path.join(root, name))
+    for directory in roots:
+        if not os.path.isdir(directory):
+            continue
+        for root, dirs, files in os.walk(directory):
+            dirs.sort()
+            for name in files:
+                if name.startswith(prefix):
+                    found.append(os.path.join(root, name))
     return sorted(set(found))
 
 
@@ -992,11 +1048,12 @@ def reachable_functions(work: Work, seed_path: str, round_name: str, timeout_s=3
 
 
 FAULT_RE = re.compile(r"illegal (read|write) at (0x[0-9a-fA-F]+)")
+EXEC_PERI_RE = re.compile(r"guest_code_fetch\s+addr=(0x[0-9a-fA-F]+)(?:\s+pc=(0x[0-9a-fA-F]+))?")
 BBL_PREFIX_RE = re.compile(r"^\[(?:0x)?([0-9a-fA-F]+),\s*(?:0x)?([0-9a-fA-F]+)\]")
 
 
 def parse_fault(log_path: str):
-    """Extract fault kind/address and the enclosing basic block from a QEMU replay log."""
+    """Extract fault kind/address (including PM_EXEC_PERI 0x72 code fetch) and enclosing BBL from a QEMU log."""
     if not os.path.exists(log_path):
         return None
     fault = None
@@ -1010,6 +1067,13 @@ def parse_fault(log_path: str):
                 prefix = BBL_PREFIX_RE.match(line)
                 if prefix:
                     bbl = {"start": "0x" + prefix.group(1).lower(), "end": "0x" + prefix.group(2).lower()}
+                continue
+            exec_match = EXEC_PERI_RE.search(line)
+            if exec_match:
+                fault = {"kind": "exec_peri", "address": hex(int(exec_match.group(1), 16))}
+                if exec_match.group(2):
+                    pc = hex(int(exec_match.group(2), 16))
+                    bbl = {"start": pc, "end": pc}
     if fault is None:
         return None
     return {"fault": fault, "bbl": bbl}
@@ -1074,6 +1138,14 @@ def cmd_identify(args):
     if args.out:
         write_json(args.out, record)
     ok(identity=record)
+
+
+def _read_os_release_first_line() -> str:
+    if not os.path.exists("/etc/os-release"):
+        return ""
+    with open("/etc/os-release", "r", encoding="utf-8", errors="replace") as handle:
+        lines = handle.read().splitlines()
+    return lines[0] if lines else ""
 
 
 def cmd_identify_all(args):
@@ -1142,7 +1214,7 @@ def cmd_identify_all(args):
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "oracle_version": VERSION,
         "host": {"user": "reproducer", "kernel": os.uname().release,
-                 "distro": open("/etc/os-release").read().splitlines()[0] if os.path.exists("/etc/os-release") else ""},
+                 "distro": _read_os_release_first_line()},
         "sources": {"p2im_real_firmware": real_root, "unpatched_est_data_set": unpatched_root},
         "counts": {"targets": len(records), "present": sum(1 for r in records if r.get("status") == "ok"),
                    "with_svc_0x3f": sum(1 for r in records if r.get("afl_call", {}).get("present"))},
@@ -1158,12 +1230,13 @@ def cmd_identify_all(args):
 SHORT_SEED = b"0\n\x00\x00"
 
 
-def write_initial_seeds(inputs_dir: str, elf_digest: str, seed_bytes: int):
-    """Keep the historical 256-byte seed and add one short seed AFL can keep after a dry-run crash."""
+def write_initial_seeds(inputs_dir: str, elf_digest: str, seed_bytes: int, trial_seed: int | None = None):
+    """Keep the historical 256-byte seed (or seed-parameterized paired variant) plus a 4B short seed."""
     os.makedirs(inputs_dir, exist_ok=True)
     seed_path = os.path.join(inputs_dir, "seed-random")
     if not os.path.exists(seed_path):
-        material = hashlib.sha256(("mcu-p2im/seed/" + elf_digest).encode()).digest()
+        tag = "mcu-p2im/seed/" + elf_digest if trial_seed is None else f"mcu-p2im/seed/{elf_digest}/trial/{trial_seed}"
+        material = hashlib.sha256(tag.encode()).digest()
         stream = bytearray()
         counter = 0
         while len(stream) < seed_bytes:
@@ -1190,6 +1263,7 @@ def cmd_prepare(args):
     spec = BOARD_FOR_TARGET[args.target]
     board = args.board or spec[0]
     mcu = args.mcu or spec[1]
+    trial_seed = getattr(args, "trial_seed", None)
     os.makedirs(work.dir, exist_ok=True)
     dest = os.path.join(work.dir, args.target + ".elf")
     if not os.path.exists(dest) or sha256_file(dest) != digest:
@@ -1198,6 +1272,7 @@ def cmd_prepare(args):
         "schema": "mcu-p2im/target-0.2",
         "target": args.target,
         "slug": work.slug,
+        "trial_seed": trial_seed,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "elf": {"path": dest, "source_path": elf, "sha256": digest, "bytes": os.path.getsize(dest)},
         "board": {"qemu_board": board, "mcu": mcu},
@@ -1209,18 +1284,45 @@ def cmd_prepare(args):
     }
     write_json(work.meta_path, work.meta)
     shim = work.install_shim(os.path.join(args.tools_root, "qemu", "qemu-system-gnuarmeclipse"))
-    seed_path, short_path = write_initial_seeds(os.path.join(work.dir, "inputs"), digest, args.seed_bytes)
-    long_paths = [path for path in (work.cfg_path("s1"), work.model_path("0.random.1")) if len(path) >= 100]
+    seed_path, short_path = write_initial_seeds(
+        os.path.join(work.dir, "inputs"), digest, args.seed_bytes, trial_seed=trial_seed
+    )
+    long_paths = [
+        path for path in (work.cfg_path("s1"), work.model_path("0.seed-random.10"), work.model_path("0.q9999.10"))
+        if len(path.encode("utf-8")) >= 100
+    ]
     if long_paths:
         fail(EXIT_REFUSED, "working paths exceed the P2IM -c 100-byte limit", paths=long_paths)
     ok(target=args.target, work_dir=work.dir, elf_sha256=digest, board=board, mcu=mcu,
+       trial_seed=trial_seed,
        shim=shim, seed_sha256=sha256_file(seed_path), seed_bytes=os.path.getsize(seed_path),
        short_seed_sha256=sha256_file(short_path), short_seed_bytes=os.path.getsize(short_path))
+
+
+def classify_smoke_outcome(rc, timed_out: bool, fault) -> str:
+    if timed_out:
+        return "timeout"
+    if rc is None or rc in (126, 127):
+        return "error"
+    if fault or rc in (0x72, 0xFF, 139, -11):
+        return "crash"
+    if rc in (0, 0x40, 0x41):
+        return "ok"
+    return "error"
+
+
+def read_log_tail(path: str, max_lines: int = 20) -> list[str]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        lines = handle.read().splitlines()
+    return lines[-max_lines:]
 
 
 def cmd_smoke(args):
     work = Work(args.work_root, args.target)
     work.require()
+    work.require_qemu(args.tools_root)
     seed = args.seed or os.path.join(work.dir, "inputs", "seed-random")
     round_name = args.round or work.latest_round()
     out_path = os.path.join(work.evidence_dir(), "smoke.log")
@@ -1231,10 +1333,15 @@ def cmd_smoke(args):
     rc, timed_out, duration = spawn_bounded(command, work.dir, work.execution_env(), args.timeout,
                                             out_path, owned=work.owned, label="smoke")
     fault = parse_fault(out_path)
-    outcome = "timeout" if timed_out else ("crash" if (fault or rc in (0xFF, 139, -11)) else "ok")
+    outcome = classify_smoke_outcome(rc, timed_out, fault)
     result = {"target": args.target, "outcome": outcome, "exit_code": rc, "timed_out": timed_out,
               "duration_s": duration, "fault": fault, "seed_sha256": sha256_file(seed),
               "round": round_name, "log": out_path, "instruction_authority": "none"}
+    if outcome == "error":
+        log_tail = read_log_tail(out_path)
+        result["log_tail"] = log_tail
+        write_json(os.path.join(work.evidence_dir(), "smoke.json"), result)
+        fail(EXIT_FAILED, "smoke execution failed (exit_code=%s)" % rc, smoke=result, log_tail=log_tail)
     write_json(os.path.join(work.evidence_dir(), "smoke.json"), result)
     ok(smoke=result)
 
@@ -1242,6 +1349,7 @@ def cmd_smoke(args):
 def cmd_me(args):
     work = Work(args.work_root, args.target)
     work.require()
+    work.require_qemu(args.tools_root)
     os.makedirs(os.path.join(work.dir, "run"), exist_ok=True)
     round_name = args.round or "0"
     cfg = work.write_fuzz_cfg("me-%s" % round_name.replace(".", "-"),
@@ -1307,62 +1415,233 @@ def sweep_work(work: "Work") -> list[dict]:
     return killed
 
 
-def cmd_fuzz(args):
-    work = Work(args.work_root, args.target)
-    work.require()
-    segment = args.segment or ("s%d" % (len([n for n in os.listdir(work.segments_dir())
-                                             if re.match(r"^s\d+\.json$", n)]) + 1))
-    output_dir = os.path.join(work.dir, "outputs-" + segment)
-    if os.path.isdir(output_dir) and os.listdir(output_dir):
-        fail(EXIT_REFUSED, "segment output directory is not empty", path=output_dir)
+def prepare_segment_inputs(work: Work, segment: str, include_proposed: bool = False, inherit_queue: str | None = None) -> dict:
+    """Assemble segment-local inputs with ultra-short names (<8B) so 0.<seed>.<n>/peripheral_model.json
+    stays strictly under P2IM AFL's 100-byte MODEL_IF_LEN buffer, without touching original dirs."""
     base_inputs = os.path.join(work.dir, "inputs")
     if not os.path.isdir(base_inputs):
         os.makedirs(base_inputs)
+
+    src_queue_dir = None
+    if inherit_queue is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", inherit_queue):
+            fail(EXIT_REFUSED, "invalid inherit-queue segment name", segment=inherit_queue)
+        src_queue_dir = os.path.join(work.dir, "outputs-" + inherit_queue, "queue")
+        if not os.path.isdir(src_queue_dir):
+            fail(EXIT_REFUSED, "inherit queue directory does not exist", segment=inherit_queue, path=src_queue_dir)
+
+    base_files = [
+        name for name in sorted(os.listdir(base_inputs))
+        if not name.startswith(".") and name != "README.txt" and os.path.isfile(os.path.join(base_inputs, name))
+    ]
+    if not include_proposed and inherit_queue is None:
+        return {
+            "input_dir": base_inputs,
+            "base_seeds": len(base_files),
+            "inherit_queue": None,
+            "inherited_queue_total": 0,
+            "inherited_queue_files": 0,
+            "inherited_queue_deduped": 0,
+            "proposed_seeds": 0,
+            "seed_map_path": None,
+        }
+
+    input_dir = os.path.join(work.dir, "inputs-" + segment)
+    if os.path.isdir(input_dir):
+        shutil.rmtree(input_dir)
+    os.makedirs(input_dir)
+
+    seen_sha256: set[str] = set()
+    seed_map: list[dict] = []
+    for idx, name in enumerate(base_files):
+        src = os.path.join(base_inputs, name)
+        digest = sha256_file(src)
+        seen_sha256.add(digest)
+        dest_name = name if len(name) <= 12 else f"b{idx:02d}"
+        shutil.copyfile(src, os.path.join(input_dir, dest_name))
+        seed_map.append({"dest": dest_name, "kind": "base", "source": name, "sha256": digest, "bytes": os.path.getsize(src)})
+
+    inherited_total = 0
+    inherited_copied = 0
+    inherited_deduped = 0
+    if src_queue_dir is not None and inherit_queue is not None:
+        for name in sorted(os.listdir(src_queue_dir)):
+            if name.startswith(".") or name == "README.txt":
+                continue
+            src = os.path.join(src_queue_dir, name)
+            if not os.path.isfile(src):
+                continue
+            inherited_total += 1
+            digest = sha256_file(src)
+            if digest in seen_sha256:
+                inherited_deduped += 1
+                continue
+            seen_sha256.add(digest)
+            dest_name = f"q{inherited_copied:04d}"
+            shutil.copyfile(src, os.path.join(input_dir, dest_name))
+            seed_map.append({
+                "dest": dest_name, "kind": "inherited_queue", "segment": inherit_queue,
+                "source": name, "sha256": digest, "bytes": os.path.getsize(src),
+            })
+            inherited_copied += 1
+
     proposed_copied = 0
-    input_dir = base_inputs
-    if args.include_proposed:
-        input_dir = os.path.join(work.dir, "inputs-" + segment)
-        if os.path.isdir(input_dir):
-            shutil.rmtree(input_dir)
-        os.makedirs(input_dir)
-        for name in sorted(os.listdir(base_inputs)):
-            src = os.path.join(base_inputs, name)
-            if os.path.isfile(src):
-                shutil.copyfile(src, os.path.join(input_dir, name))
+    if include_proposed:
         proposed = os.path.join(work.dir, "proposed-seeds")
         if os.path.isdir(proposed):
             for name in sorted(os.listdir(proposed)):
                 if not name.endswith(".bin"):
                     continue
-                shutil.copyfile(os.path.join(proposed, name), os.path.join(input_dir, "proposed-" + name))
+                src = os.path.join(proposed, name)
+                if not os.path.isfile(src):
+                    continue
+                digest = sha256_file(src)
+                dest_name = f"p{proposed_copied:02d}"
+                shutil.copyfile(src, os.path.join(input_dir, dest_name))
+                seed_map.append({"dest": dest_name, "kind": "proposed", "source": name, "sha256": digest, "bytes": os.path.getsize(src)})
                 proposed_copied += 1
+
+    # Verify every assembled seed yields a <100-byte P2IM -c peripheral_model.json path even at round .10
+    overlong = [
+        work.model_path(f"0.{item['dest']}.10")
+        for item in seed_map
+        if len(work.model_path(f"0.{item['dest']}.10").encode("utf-8")) >= 100
+    ]
+    if overlong:
+        fail(EXIT_REFUSED, "segment seed model_if path exceeds P2IM 100-byte -c limit", paths=overlong[:3])
+
+    map_path = os.path.join(work.evidence_dir(), f"inputs-{segment}-map.json")
+    write_json(map_path, {"segment": segment, "count": len(seed_map), "seeds": seed_map, "instruction_authority": "none"})
+
+    return {
+        "input_dir": input_dir,
+        "base_seeds": len(base_files),
+        "inherit_queue": inherit_queue,
+        "inherited_queue_total": inherited_total,
+        "inherited_queue_files": inherited_copied,
+        "inherited_queue_deduped": inherited_deduped,
+        "proposed_seeds": proposed_copied,
+        "seed_map_path": map_path,
+    }
+
+
+def prepare_segment_model_continuity(work: Work, segment: str, tools_root: str = DEFAULT_TOOLS_ROOT) -> tuple[str | None, bool]:
+    """Carry the cumulative peripheral model from prior segments into segment >= 2 and archive old 1..N dirs
+    so QEMU's forkserver (run_num=1..) neither resets to round 0 nor leaves stale higher-numbered rounds."""
+    latest = work.latest_round()
+    fuzz_py = os.path.join(tools_root, "scripts", "fuzz.py")
+    supports_skip_prefix = False
+    if os.path.isfile(fuzz_py):
+        try:
+            with open(fuzz_py, "r", encoding="utf-8", errors="replace") as handle:
+                supports_skip_prefix = "--skip-seed-prefix" in handle.read()
+        except OSError:
+            supports_skip_prefix = False
+    if not latest or segment == "s1":
+        return None, supports_skip_prefix
+
+    carry_round = f"0.{segment}"
+    carry_model = work.model_path(carry_round)
+    if len(carry_model.encode("utf-8")) >= 100:
+        fail(EXIT_REFUSED, "carryover model path exceeds P2IM 100-byte -c limit", path=carry_model)
+    os.makedirs(os.path.dirname(carry_model), exist_ok=True)
+    shutil.copyfile(work.model_path(latest), carry_model)
+
+    int_rounds = [r for r in work.round_dirs() if re.fullmatch(r"[1-9]\d*", r)]
+    if int_rounds:
+        archive_dir = os.path.join(work.dir, "rounds-archive", f"before-{segment}")
+        os.makedirs(archive_dir, exist_ok=True)
+        for rname in int_rounds:
+            src_dir = os.path.join(work.dir, rname)
+            dst_dir = os.path.join(archive_dir, rname)
+            if os.path.exists(dst_dir):
+                shutil.rmtree(dst_dir)
+            shutil.move(src_dir, dst_dir)
+    return carry_model, supports_skip_prefix
+
+
+def cmd_fuzz(args):
+    work = Work(args.work_root, args.target)
+    work.require()
+    work.require_qemu(args.tools_root)
+    segment = args.segment or ("s%d" % (len([n for n in os.listdir(work.segments_dir())
+                                             if re.match(r"^s\d+\.json$", n)]) + 1))
+    output_dir = os.path.join(work.dir, "outputs-" + segment)
+    if os.path.isdir(output_dir) and os.listdir(output_dir):
+        fail(EXIT_REFUSED, "segment output directory is not empty", path=output_dir)
+    prep = prepare_segment_inputs(
+        work,
+        segment,
+        include_proposed=bool(args.include_proposed),
+        inherit_queue=args.inherit_queue,
+    )
+    carry_model, supports_skip = prepare_segment_model_continuity(work, segment, args.tools_root)
+    input_dir = prep["input_dir"]
     cfg = work.write_fuzz_cfg(segment, output_dir, args.afl_bin, args.p2im_root,
                               input_dir=input_dir, tools_root=args.tools_root)
-    if len(cfg) >= 100:
-        fail(EXIT_REFUSED, "fuzz.cfg path exceeds 100 bytes", path=cfg)
+    active_model_probe = carry_model or work.model_path(work.latest_round() or "0")
+    if len(active_model_probe.encode("utf-8")) >= 100:
+        fail(EXIT_REFUSED, "model_if path exceeds 100 bytes", path=active_model_probe)
     log_path = os.path.join(work.evidence_dir(), "fuzz-%s.log" % segment)
     command = ["python3", os.path.join(args.tools_root, "scripts", "fuzz.py"), "-c", cfg]
+    if carry_model:
+        command.extend(["--model-if", carry_model])
+    if supports_skip and prep["inherited_queue_files"] > 0:
+        command.extend(["--skip-seed-prefix", "q"])
+    max_execs = getattr(args, "max_execs", 0) or 0
+    stats_path = os.path.join(output_dir, "fuzzer_stats")
+    exec_cap_hit = {"reached": False}
+
+    def _check_exec_cap() -> bool:
+        if max_execs <= 0 or not os.path.exists(stats_path):
+            return False
+        cur = int(parse_fuzzer_stats(stats_path).get("execs_done") or 0)
+        if cur >= max_execs:
+            exec_cap_hit["reached"] = True
+            return True
+        return False
+
     sweep_work(work)
-    rc, timed_out, duration = spawn_bounded(command, work.dir, work.execution_env(), args.seconds, log_path,
-                                            owned=work.owned, label="fuzz-%s" % segment)
+    rc, timed_out, duration = spawn_bounded(
+        command, work.dir, work.execution_env(), args.seconds, log_path,
+        owned=work.owned, label="fuzz-%s" % segment,
+        stop_when=_check_exec_cap if max_execs > 0 else None,
+    )
     strays = sweep_work(work)
-    stats = parse_fuzzer_stats(os.path.join(output_dir, "fuzzer_stats"))
+    stats = parse_fuzzer_stats(stats_path)
     crashes = crash_files(output_dir)
+    program_abort = False
+    if os.path.isfile(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+            program_abort = "PROGRAM ABORT" in handle.read()
+    execs_done = int(stats.get("execs_done", 0) or 0)
+    aborted = program_abort or (args.seconds >= 5 and execs_done == 0 and not exec_cap_hit["reached"])
     record = {
         "schema": "mcu-p2im/segment-0.2",
         "target": args.target, "segment": segment, "requested_seconds": args.seconds,
+        "max_execs": max_execs if max_execs > 0 else None,
+        "exec_cap_reached": exec_cap_hit["reached"],
         "duration_s": duration, "exit_code": rc, "timed_out": timed_out,
+        "program_abort": program_abort, "aborted": aborted,
         "output_dir": output_dir, "stats": stats,
-        "execs_done": stats.get("execs_done", 0), "paths_total": stats.get("paths_total", 0),
+        "execs_done": execs_done, "paths_total": stats.get("paths_total", 0),
         "unique_crashes": stats.get("unique_crashes", 0), "unique_hangs": stats.get("unique_hangs", 0),
         "bitmap_cvg": stats.get("bitmap_cvg"),
         "queue_files": len(queue_files(output_dir)), "crash_files": len(crashes),
-        "crashes": crashes, "rounds": work.round_dirs(), "log": log_path,
-        "input_dir": input_dir, "proposed_seeds": proposed_copied,
+        "crashes": crashes, "rounds": work.round_dirs(), "carry_model": carry_model, "log": log_path,
+        "input_dir": input_dir, "proposed_seeds": prep["proposed_seeds"],
+        "inherit_queue": prep["inherit_queue"],
+        "inherited_queue_total": prep["inherited_queue_total"],
+        "inherited_queue_files": prep["inherited_queue_files"],
+        "inherited_queue_deduped": prep["inherited_queue_deduped"],
+        "seed_map_path": prep["seed_map_path"],
         "strays_killed": strays,
         "instruction_authority": "none",
     }
     write_json(os.path.join(work.segments_dir(), segment + ".json"), record)
+    if aborted:
+        fail(EXIT_FAILED, "AFL segment %s aborted (program_abort=%s, execs_done=%d)" % (segment, program_abort, execs_done),
+             segment=record, log_tail=read_log_tail(log_path))
     ok(segment=record)
 
 
@@ -1442,7 +1721,7 @@ def replay_once(work: Work, round_name: str, input_path: str, timeout_s: int, wi
             last_bbl = entries[-1]
     if timed_out:
         outcome = "hang"
-    elif parsed or rc in (0xFF, 139, -11):
+    elif parsed or rc in (0x72, 0xFF, 139, -11):
         outcome = "crash"
     elif rc == 0:
         outcome = "ok"
@@ -1482,6 +1761,7 @@ def resolve_input(work: "Work", value: str) -> str | None:
 def cmd_replay(args):
     work = Work(args.work_root, args.target)
     work.require()
+    work.require_qemu(args.tools_root)
     round_name = args.round or work.latest_round()
     if not round_name:
         fail(EXIT_REFUSED, "no model round on disk")
@@ -1512,11 +1792,13 @@ def _replay_bytes(work: Work, round_name: str, data: bytes, timeout_s: int, tag:
 def cmd_contrast(args):
     work = Work(args.work_root, args.target)
     work.require()
+    work.require_qemu(args.tools_root)
     round_name = args.round or work.latest_round()
     input_path = resolve_input(work, args.input)
     if input_path is None:
         fail(EXIT_REFUSED, "no such input: %s" % args.input)
-    original = open(input_path, "rb").read()
+    with open(input_path, "rb") as handle:
+        original = handle.read()
     baseline = replay_once(work, round_name, input_path, args.timeout, with_trace=False)
     if baseline["outcome"] != "crash":
         fail(EXIT_REFUSED, "the input does not reproduce a crash under this round",
@@ -2316,6 +2598,8 @@ def cmd_slice_paths(args):
                 seeds.extend(queue_files(os.path.join(work.dir, name))[: args.reach_seeds])
                 seeds.extend([crash["path"] for crash in crash_files(os.path.join(work.dir, name))])
         seeds = seeds[: max(args.reach_seeds, 1) * 2]
+        if seeds:
+            work.require_qemu(args.tools_root)
         cache_path = os.path.join(work.analysis_dir(), "seed-functions.json")
         cache = read_json(cache_path) if os.path.exists(cache_path) else {}
         for seed in seeds:
@@ -2414,6 +2698,7 @@ def cmd_gdb_watch(args):
     """
     work = Work(args.work_root, args.target)
     work.require()
+    work.require_qemu(args.tools_root)
     gdb = args.gdb or shutil.which("gdb-multiarch") or shutil.which("gdb")
     if not gdb or not os.path.exists(gdb):
         fail(EXIT_REFUSED, "gdb not available")
@@ -2438,46 +2723,46 @@ def cmd_gdb_watch(args):
     command = [work.qemu_shim(), "-nographic", "-gdb", "tcp::%d" % port, "-S",
                "-board", work.board, "-mcu", work.mcu, "-image", work.elf,
                "-pm-stage", "3", "-aflFile", input_path, "-model-input", work.model_path(round_name)]
-    handle = open(log_path, "wb")
-    try:
-        proc = subprocess.Popen(command, cwd=work.dir, env=work.execution_env(), stdout=handle,
-                                stderr=subprocess.STDOUT, start_new_session=True, stdin=subprocess.DEVNULL)
-    except OSError as exc:
-        handle.close()
-        fail(EXIT_FAILED, "qemu gdb stub failed to start", detail=str(exc))
-    pgid = os.getpgid(proc.pid)
-    work.owned.register(pgid, "gdb-watch", command)
-    script = "\n".join([
-        "set pagination off", "set confirm off",
-        "target remote 127.0.0.1:%d" % port,
-        "watch *(unsigned char*)0x%x" % watch,
-        "continue", "quit",
-    ])
     gdb_log = os.path.join(work.evidence_dir(), "gdb-watch.gdb")
     hit = False
     gdb_error = None
-    try:
-        completed = subprocess.run([gdb, "-batch", "-nx", "-q"], input=script, capture_output=True,
-                                   text=True, timeout=args.timeout)
-        open(gdb_log, "w", encoding="utf-8").write(completed.stdout + "\n" + completed.stderr)
-        text = completed.stdout + "\n" + completed.stderr
-        hit = "Watchpoint" in text or "Hardware watchpoint" in text
-        if "Connection refused" in text or "Remote communication error" in text:
-            gdb_error = "gdb could not attach"
-            hit = False
-    except subprocess.TimeoutExpired as exc:
-        gdb_error = "gdb timed out"
-        partial = ((exc.stdout or "") if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", "replace"))
-        open(gdb_log, "w", encoding="utf-8").write(partial)
-    finally:
-        if _alive(pgid):
-            _signal_group(pgid, signal.SIGKILL)
+    with open(log_path, "wb") as handle:
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        work.owned.forget(pgid)
-        handle.close()
+            proc = subprocess.Popen(command, cwd=work.dir, env=work.execution_env(), stdout=handle,
+                                    stderr=subprocess.STDOUT, start_new_session=True, stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            fail(EXIT_FAILED, "qemu gdb stub failed to start", detail=str(exc))
+        pgid = os.getpgid(proc.pid)
+        work.owned.register(pgid, "gdb-watch", command)
+        script = "\n".join([
+            "set pagination off", "set confirm off",
+            "target remote 127.0.0.1:%d" % port,
+            "watch *(unsigned char*)0x%x" % watch,
+            "continue", "quit",
+        ])
+        try:
+            completed = subprocess.run([gdb, "-batch", "-nx", "-q"], input=script, capture_output=True,
+                                       text=True, timeout=args.timeout)
+            text = completed.stdout + "\n" + completed.stderr
+            with open(gdb_log, "w", encoding="utf-8") as gdb_handle:
+                gdb_handle.write(text)
+            hit = "Watchpoint" in text or "Hardware watchpoint" in text
+            if "Connection refused" in text or "Remote communication error" in text:
+                gdb_error = "gdb could not attach"
+                hit = False
+        except subprocess.TimeoutExpired as exc:
+            gdb_error = "gdb timed out"
+            partial = ((exc.stdout or "") if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", "replace"))
+            with open(gdb_log, "w", encoding="utf-8") as gdb_handle:
+                gdb_handle.write(partial)
+        finally:
+            if _alive(pgid):
+                _signal_group(pgid, signal.SIGKILL)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            work.owned.forget(pgid)
     ok(gdb={"watch": "0x%x" % watch, "hit": hit, "error": gdb_error, "log": gdb_log,
             "instruction_authority": "none"})
 
@@ -2495,6 +2780,217 @@ def cmd_cleanup(args):
     strays = sweep_work(work)
     remaining = [entry for entry in owned.entries]
     ok(cleaned=killed, strays=strays, remaining=remaining)
+
+
+def extract_unique_bbls_from_trace(trace_path: str) -> tuple[list[str], list[str]]:
+    """Return sorted unique (start..end BBL ranges, demangled function names) from a QEMU trace."""
+    if not os.path.exists(trace_path):
+        return [], []
+    bbls: set[str] = set()
+    raw_funcs: set[str] = set()
+    with open(trace_path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = TRACE_RE.match(line.strip())
+            if not match:
+                continue
+            bbls.add(f"{match.group(1).lower()}..{match.group(2).lower()}")
+            raw_funcs.add(match.group(3))
+    names = demangle(raw_funcs)
+    funcs = sorted({names.get(name, name) for name in raw_funcs})
+    return sorted(bbls), funcs
+
+
+def compute_bbl_union(
+    per_segment_bbls: dict[str, set[str]],
+    per_segment_funcs: dict[str, set[str]] | None = None,
+    segment_order: list[str] | None = None,
+) -> dict:
+    """Compute per-segment BBL counts, incremental deltas, and cross-segment union coverage."""
+    order = list(segment_order) if segment_order is not None else sorted(per_segment_bbls)
+    cum_bbls: set[str] = set()
+    cum_funcs: set[str] = set()
+    segments: dict[str, dict] = {}
+    for seg in order:
+        seg_bbls = set(per_segment_bbls.get(seg, ()))
+        seg_funcs = set((per_segment_funcs or {}).get(seg, ()))
+        new_bbls = seg_bbls - cum_bbls
+        cum_bbls |= seg_bbls
+        cum_funcs |= seg_funcs
+        segments[seg] = {
+            "unique_bbls": len(seg_bbls),
+            "unique_functions": len(seg_funcs),
+            "new_bbls_over_prior": len(new_bbls),
+            "cumulative_unique_bbls": len(cum_bbls),
+        }
+    return {
+        "segments": segments,
+        "union": {
+            "unique_bbls": len(cum_bbls),
+            "unique_functions": len(cum_funcs),
+            "bbl_set_sorted": sorted(cum_bbls),
+            "function_set_sorted": sorted(cum_funcs),
+        },
+    }
+
+
+def _discover_segment_names(work: Work) -> list[str]:
+    names: set[str] = set()
+    if os.path.isdir(work.dir):
+        for entry in os.listdir(work.dir):
+            if entry.startswith("outputs-") and os.path.isdir(os.path.join(work.dir, entry)):
+                seg = entry[len("outputs-"):]
+                if seg != "nome" and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", seg):
+                    names.add(seg)
+    def sort_key(seg: str):
+        m = re.fullmatch(r"s(\d+)", seg)
+        return (0, int(m.group(1)), seg) if m else (1, 0, seg)
+    return sorted(names, key=sort_key)
+
+
+def cmd_bbl_coverage(args):
+    """Compute exact per-segment and union unique basic-block coverage by replaying queue/crash inputs."""
+    work = Work(args.work_root, args.target)
+    work.require()
+    work.require_qemu(args.tools_root)
+    round_name = args.round or work.latest_round()
+    if not round_name:
+        fail(EXIT_REFUSED, "no model round on disk")
+
+    if args.segments:
+        segments = [seg.strip() for seg in args.segments.split(",") if seg.strip()]
+        for seg in segments:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", seg):
+                fail(EXIT_REFUSED, "invalid segment name", segment=seg)
+            if not os.path.isdir(os.path.join(work.dir, "outputs-" + seg)):
+                fail(EXIT_REFUSED, "segment output directory missing", segment=seg)
+    else:
+        segments = _discover_segment_names(work)
+        if not segments:
+            fail(EXIT_REFUSED, "no segment output directories found under %s" % work.dir)
+
+    buckets = [b.strip() for b in args.buckets.split(",") if b.strip()]
+    allowed_buckets = {"queue", "crashes", "hangs"}
+    if not buckets or any(b not in allowed_buckets for b in buckets):
+        fail(EXIT_REFUSED, "invalid coverage buckets", buckets=buckets)
+
+    cache_path = os.path.join(work.analysis_dir(), "bbl-cache.json")
+    cache: dict[str, dict] = {}
+    if os.path.exists(cache_path):
+        try:
+            loaded = read_json(cache_path)
+            if isinstance(loaded, dict):
+                cache = loaded
+        except Exception:
+            cache = {}
+
+    tmp_dir = os.path.join(work.evidence_dir(), "tmp-bbl")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_trace = os.path.join(tmp_dir, "trace.txt")
+    tmp_log = os.path.join(tmp_dir, "qemu.log")
+
+    per_seg_bbls: dict[str, set[str]] = {}
+    per_seg_funcs: dict[str, set[str]] = {}
+    per_seg_counts: dict[str, int] = {}
+    cache_dirty = False
+    try:
+        for seg in segments:
+            seg_out = os.path.join(work.dir, "outputs-" + seg)
+            seed_paths: list[str] = []
+            for bucket in buckets:
+                bdir = os.path.join(seg_out, bucket)
+                if not os.path.isdir(bdir):
+                    continue
+                for name in sorted(os.listdir(bdir)):
+                    if name == "README.txt" or name.startswith("."):
+                        continue
+                    full = os.path.join(bdir, name)
+                    if os.path.isfile(full):
+                        seed_paths.append(full)
+            if args.max_inputs_per_segment > 0:
+                seed_paths = seed_paths[:args.max_inputs_per_segment]
+            seg_bbls: set[str] = set()
+            seg_funcs: set[str] = set()
+            for seed_path in seed_paths:
+                digest = sha256_file(seed_path)
+                ckey = f"{round_name}:{digest}"
+                entry = cache.get(ckey)
+                if not isinstance(entry, dict) or "bbls" not in entry:
+                    for stale in (tmp_trace, tmp_log):
+                        if os.path.exists(stale):
+                            os.unlink(stale)
+                    command = [
+                        work.qemu_shim(), "-nographic", "-board", work.board, "-mcu", work.mcu,
+                        "-image", work.elf, "-pm-stage", "3", "-aflFile", seed_path,
+                        "-model-input", work.model_path(round_name), "-trace", tmp_trace,
+                    ]
+                    rc, timed_out, _ = spawn_bounded(
+                        command, work.dir, work.execution_env(), args.timeout, tmp_log,
+                        owned=work.owned, label="bbl-cov",
+                    )
+                    bbls, funcs = extract_unique_bbls_from_trace(tmp_trace)
+                    entry = {"bbls": bbls, "functions": funcs, "exit_code": rc, "timed_out": timed_out}
+                    cache[ckey] = entry
+                    cache_dirty = True
+                seg_bbls.update(entry.get("bbls") or ())
+                seg_funcs.update(entry.get("functions") or ())
+            per_seg_bbls[seg] = seg_bbls
+            per_seg_funcs[seg] = seg_funcs
+            per_seg_counts[seg] = len(seed_paths)
+    finally:
+        for stale in (tmp_trace, tmp_log):
+            if os.path.exists(stale):
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
+        if cache_dirty:
+            write_json(cache_path, cache)
+
+    computed = compute_bbl_union(per_seg_bbls, per_seg_funcs, segment_order=segments)
+    seg_details: dict[str, dict] = {}
+    total_execs_done = 0
+    total_fuzz_seconds = 0.0
+    for seg in segments:
+        row = dict(computed["segments"][seg])
+        row["inputs_traced"] = per_seg_counts[seg]
+        seg_meta_path = os.path.join(work.segments_dir(), seg + ".json")
+        if os.path.exists(seg_meta_path):
+            seg_meta = read_json(seg_meta_path)
+            execs = int(seg_meta.get("execs_done") or 0)
+            dur = float(seg_meta.get("duration_s") or 0.0)
+            row["execs_done"] = execs
+            row["duration_s"] = dur
+            row["paths_total"] = int(seg_meta.get("paths_total") or 0)
+            total_execs_done += execs
+            total_fuzz_seconds += dur
+        seg_details[seg] = row
+
+    union_meta = {
+        "unique_bbls": computed["union"]["unique_bbls"],
+        "unique_functions": computed["union"]["unique_functions"],
+    }
+    full_payload = {
+        "schema": "mcu-p2im/bbl-coverage-0.1",
+        "target": args.target,
+        "elf_sha256": work.meta["elf"]["sha256"],
+        "round": round_name,
+        "buckets": buckets,
+        "segments_order": segments,
+        "total_execs_done": total_execs_done,
+        "total_fuzz_seconds": round(total_fuzz_seconds, 3),
+        "segments": seg_details,
+        "union": union_meta,
+        "unique_bbls_list": computed["union"]["bbl_set_sorted"],
+        "unique_functions_list": computed["union"]["function_set_sorted"],
+        "instruction_authority": "none",
+    }
+    out_path = os.path.join(work.analysis_dir(), "bbl-coverage.json")
+    write_json(out_path, full_payload)
+    if args.out and os.path.abspath(args.out) != os.path.abspath(out_path):
+        write_json(args.out, full_payload)
+
+    summary = {k: v for k, v in full_payload.items() if k not in ("unique_bbls_list", "unique_functions_list")}
+    ok(coverage=summary, coverage_path=out_path)
 
 
 def cmd_aggregate(args):
@@ -2520,7 +3016,8 @@ def cmd_aggregate(args):
         replays = []
         replay_log = os.path.join(root, name, "evidence", "replays.jsonl")
         if os.path.exists(replay_log):
-            replays = [json.loads(line) for line in open(replay_log, encoding="utf-8") if line.strip()]
+            with open(replay_log, "r", encoding="utf-8") as handle:
+                replays = [json.loads(line) for line in handle if line.strip()]
         rows.append({
             "target": meta["target"], "board": meta["board"], "elf_sha256": meta["elf"]["sha256"],
             "segments": len(segments),
@@ -2592,6 +3089,8 @@ def build_parser():
     prepare.add_argument("--board")
     prepare.add_argument("--mcu")
     prepare.add_argument("--seed-bytes", type=int, default=256)
+    prepare.add_argument("--trial-seed", type=int, default=None,
+                         help="Optional paired trial seed ID (e.g. 1707/2707/3707) for deterministic seed-random derivation")
     prepare.add_argument("--auto-forkserver-pc", default=None)
     prepare.set_defaults(func=cmd_prepare)
 
@@ -2614,7 +3113,11 @@ def build_parser():
     fuzz.add_argument("--target", required=True)
     fuzz.add_argument("--segment")
     fuzz.add_argument("--seconds", type=int, required=True)
+    fuzz.add_argument("--max-execs", type=int, default=0,
+                      help="Optional target execution cap (stops AFL cleanly once fuzzer_stats execs_done >= N)")
     fuzz.add_argument("--include-proposed", action="store_true")
+    fuzz.add_argument("--inherit-queue", default=None,
+                      help="Optional prior segment name (e.g. s1) whose outputs-<seg>/queue/* are seeded into inputs-<segment>/")
     fuzz.set_defaults(func=cmd_fuzz)
 
     status = sub.add_parser("status")
@@ -2679,6 +3182,16 @@ def build_parser():
     cleanup.add_argument("--target", required=True)
     cleanup.add_argument("--sweep", action="store_true")
     cleanup.set_defaults(func=cmd_cleanup)
+
+    bbl_cov = sub.add_parser("bbl-coverage")
+    bbl_cov.add_argument("--target", required=True)
+    bbl_cov.add_argument("--segments", default="")
+    bbl_cov.add_argument("--round")
+    bbl_cov.add_argument("--buckets", default="queue,crashes")
+    bbl_cov.add_argument("--timeout", type=int, default=5)
+    bbl_cov.add_argument("--max-inputs-per-segment", type=int, default=0)
+    bbl_cov.add_argument("--out")
+    bbl_cov.set_defaults(func=cmd_bbl_coverage)
 
     aggregate = sub.add_parser("aggregate")
     aggregate.add_argument("--out", required=True)

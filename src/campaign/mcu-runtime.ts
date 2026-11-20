@@ -10,14 +10,14 @@ import { Mcup2imOracle, OracleError } from "./mcu-oracle.js";
 import { assertNoLeak, mcup2imTools, okEnvelope, refused, type Mcup2imToolPorts } from "./mcu-tools.js";
 import type { ToolEnvelope } from "./tools.js";
 import {
-  mcup2imBudget, type Mcup2imBudget, type Mcup2imConfig, type Mcup2imCrashRow, type Mcup2imReplayRow,
-  type Mcup2imRole, type Mcup2imSegmentSummary, type Mcup2imStage, type Mcup2imState,
+  mcup2imBudget, type Mcup2imBudget, type Mcup2imConfig, type Mcup2imCrashRow, type Mcup2imMode,
+  type Mcup2imReplayRow, type Mcup2imRole, type Mcup2imSegmentSummary, type Mcup2imStage, type Mcup2imState,
 } from "./mcu-types.js";
 
 export interface Mcup2imOptions {
   config: Mcup2imConfig;
   out: string;
-  mode: "real" | "offline";
+  mode: Mcup2imMode;
   selection?: PiSelection;
   budget?: Partial<Mcup2imBudget>;
   signal?: AbortSignal;
@@ -26,6 +26,100 @@ export interface Mcup2imOptions {
   bindingFactory?: (role: Mcup2imRole, signal: AbortSignal) => Promise<PiBinding>;
   /** Test hook: skip the oracle prepare call and start from an existing work directory. */
   skipPrepare?: boolean;
+  /** Resume an interrupted/partial run directory from its latest attempt_id. */
+  resumeAttemptId?: string;
+  /** Link a fresh retry run directory to a failed/partial parent run directory to accumulate budgets. */
+  parentOut?: string;
+}
+
+interface ParentAttemptSummary {
+  parent_out: string;
+  parent_run_id: string | null;
+  parent_attempt_id: string | null;
+  prior_status: string | null;
+  prior_model_requests: number;
+  prior_tokens: number;
+  prior_tools: number;
+  prior_active_ms: number;
+  prior_target_execs: number;
+}
+
+function crashFingerprint(row: Mcup2imReplayRow): string {
+  return `${row.fault?.kind ?? "unknown"}|${row.fault?.address ?? "unknown"}|${row.last_bbl?.function ?? "unknown"}`;
+}
+
+function segmentSortRank(segmentDir: string): [number, number, string] {
+  const match = /^outputs-s(\d+)$/.exec(segmentDir);
+  if (match) return [0, -Number(match[1]), segmentDir];
+  return [1, 0, segmentDir];
+}
+
+export function interleaveCrashRows(rows: Mcup2imCrashRow[]): Mcup2imCrashRow[] {
+  const buckets = new Map<string, Mcup2imCrashRow[]>();
+  for (const row of rows) {
+    const key = row.segment_dir || "default";
+    const list = buckets.get(key);
+    if (list) list.push(row);
+    else buckets.set(key, [row]);
+  }
+  const keys = [...buckets.keys()].sort((a, b) => {
+    const ra = segmentSortRank(a);
+    const rb = segmentSortRank(b);
+    if (ra[0] !== rb[0]) return ra[0] - rb[0];
+    if (ra[1] !== rb[1]) return ra[1] - rb[1];
+    return ra[2].localeCompare(rb[2]);
+  });
+  const out: Mcup2imCrashRow[] = [];
+  let cursor = 0;
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (const key of keys) {
+      const bucket = buckets.get(key);
+      const item = bucket?.[cursor];
+      if (item !== undefined) {
+        out.push(item);
+        progressed = true;
+      }
+    }
+    cursor += 1;
+  }
+  return out;
+}
+
+function loadParentAttemptSummary(parentOut: string, config: Mcup2imConfig): ParentAttemptSummary {
+  const parentDir = resolve(parentOut);
+  const accountPath = join(parentDir, "account.json");
+  requireThat(existsSync(accountPath), "PARENT_OUT_MISSING", `Parent run account.json is missing under ${parentDir}`);
+  const account = JSON.parse(readFileSync(accountPath, "utf8")) as Record<string, unknown>;
+  const statePath = join(parentDir, "state.json");
+  const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown> : null;
+  const scorePath = join(parentDir, "score-owned.json");
+  const score = existsSync(scorePath) ? JSON.parse(readFileSync(scorePath, "utf8")) as Record<string, unknown> : null;
+  if (state?.target) {
+    requireThat(state.target === config.target, "PARENT_TARGET_MISMATCH", "Parent run belongs to a different target");
+  }
+  if (state?.elf_sha256) {
+    requireThat(state.elf_sha256 === config.elf_sha256, "PARENT_TARGET_MISMATCH", "Parent run belongs to a different ELF hash");
+  }
+  const priorCumulative = (score?.cumulative_cost as Record<string, unknown> | null | undefined) ?? null;
+  const baseRequests = priorCumulative ? Number(priorCumulative.total_model_requests ?? 0)
+    : (Array.isArray(account.requests) ? account.requests.length : 0);
+  const baseTokens = priorCumulative ? Number(priorCumulative.total_tokens ?? 0) : Number(account.tokens ?? 0);
+  const baseWall = priorCumulative ? Number(priorCumulative.total_active_ms ?? 0) : Number(account.active_ms ?? 0);
+  const baseExecs = priorCumulative ? Number(priorCumulative.total_target_execs ?? 0)
+    : Number(score?.total_execs_done ?? (state?.totals as Record<string, unknown> | undefined)?.target_execs ?? account.target_execs ?? 0);
+  return {
+    parent_out: parentDir,
+    parent_run_id: typeof account.run_id === "string" ? account.run_id : null,
+    parent_attempt_id: typeof account.attempt_id === "string" ? account.attempt_id : null,
+    prior_status: typeof account.status === "string" ? account.status : null,
+    prior_model_requests: baseRequests,
+    prior_tokens: baseTokens,
+    prior_tools: Number(account.tools ?? 0),
+    prior_active_ms: baseWall,
+    prior_target_execs: baseExecs,
+  };
 }
 
 /** Indexed overlap outranks a plain self-reference, so a later global cannot replace the via name. */
@@ -164,6 +258,12 @@ export class Mcup2imCampaign {
   private stopped = false;
   private readonly replayCache = new Map<string, Mcup2imReplayRow[]>();
   private readonly contrastCache = new Map<string, Record<string, unknown>>();
+  private readonly stopReasons: Record<string, number> = {};
+  private readonly analyzeStopReasons: Record<string, number> = {};
+  private readonly warnings: string[] = [];
+  private readonly priorAttempts: ParentAttemptSummary | null;
+  private budgetTruncated = false;
+  private discoveryStartedAt: number | null = null;
 
   private constructor(options: Mcup2imOptions) {
     this.options = options;
@@ -171,21 +271,53 @@ export class Mcup2imCampaign {
     this.directory = resolve(options.out);
     mkdirSync(this.directory, { recursive: true });
     this.oracle = options.oracle ?? new Mcup2imOracle(options.config);
+    const priorStatePath = join(this.directory, "state.json");
+    const priorState = options.resumeAttemptId && existsSync(priorStatePath)
+      ? JSON.parse(readFileSync(priorStatePath, "utf8")) as Partial<Mcup2imState>
+      : null;
+    this.priorAttempts = options.parentOut ? loadParentAttemptSummary(options.parentOut, options.config) : null;
     this.governance = new RunGovernance(this.directory, {
       kind: "mcu-p2im", config: options.config, mode: options.mode,
     }, {
       max_model_requests: this.limits.max_model_requests, max_tokens: this.limits.max_tokens,
       max_output_tokens: this.limits.max_output_tokens, max_target_execs: this.limits.max_target_execs,
       tool_calls: this.limits.tool_calls, wall_ms: this.limits.wall_ms,
-    }, undefined, () => {});
+    }, options.resumeAttemptId, () => {});
+    const restoredSegments = Array.isArray(priorState?.segments) ? [...priorState.segments] : [];
+    const restoredExecs = restoredSegments.reduce((sum, row) => sum + Number(row.execs_done ?? 0), 0);
+    if (Array.isArray(priorState?.warnings)) this.warnings.push(...priorState.warnings);
     this.state = {
       schema_version: 1, run_id: this.governance.account.run_id, attempt_id: this.governance.account.attempt_id,
       target: options.config.target, elf_sha256: options.config.elf_sha256, mode: options.mode,
+      trial_seed: options.config.trial_seed,
+      work_root: options.config.work_root, work_dir: priorState?.work_dir ?? this.workDir(),
       status: "running", stage: "prepare",
-      totals: { model_calls: 0, tokens: 0, tool_calls: 0, target_execs: 0, wall_ms: 0 },
-      rounds: [], segments: [],
+      totals: {
+        model_calls: this.governance.account.requests.length,
+        tokens: this.governance.account.tokens,
+        tool_calls: this.governance.account.tools,
+        target_execs: restoredExecs,
+        wall_ms: this.governance.activeMs,
+      },
+      stage_wall_ms: priorState?.stage_wall_ms ? { ...priorState.stage_wall_ms } : {},
+      rounds: Array.isArray(priorState?.rounds) ? [...priorState.rounds] : [],
+      segments: restoredSegments,
       crashes: { raw_files: 0, unique: 0, replayed: 0, reproduced: 0 },
-      layers: { l1: 0, l2: 0, l3: 0, l4: 0 }, artifacts: {}, instruction_authority: "none",
+      layers: { l1: 0, l2: 0, l3: 0, l4: 0 },
+      layers_files: { l1: 0, l2: 0, l3: 0, l4: 0 },
+      prior_attempts: this.priorAttempts ? { ...this.priorAttempts } : (priorState?.prior_attempts ?? null),
+      model_diagnostics: {
+        provider: options.selection?.provider ?? null,
+        model: options.selection?.model ?? null,
+        thinking: options.mode === "real" ? (options.selection?.thinking ?? "low") : null,
+        max_output_tokens: this.limits.max_output_tokens,
+        stop_reasons: {},
+        analyze_length_truncations: 0,
+        warnings: [...this.warnings],
+      },
+      warnings: [...this.warnings],
+      coverage: priorState?.coverage ?? null,
+      artifacts: priorState?.artifacts ? { ...priorState.artifacts } : {}, instruction_authority: "none",
     };
     options.signal?.addEventListener("abort", () => this.stop(), { once: true });
   }
@@ -227,11 +359,16 @@ export class Mcup2imCampaign {
     this.state.stage = name;
     await this.publish("stage:" + name);
     this.ledger({ kind: "stage_started", stage: name });
+    const stageStarted = Date.now();
     try {
       const value = await body();
-      this.ledger({ kind: "stage_finished", stage: name });
+      const elapsed = Math.max(0, Date.now() - stageStarted);
+      this.state.stage_wall_ms[name] = (this.state.stage_wall_ms[name] ?? 0) + elapsed;
+      this.ledger({ kind: "stage_finished", stage: name, wall_ms: this.state.stage_wall_ms[name] });
       return value;
     } catch (error) {
+      const elapsed = Math.max(0, Date.now() - stageStarted);
+      this.state.stage_wall_ms[name] = (this.state.stage_wall_ms[name] ?? 0) + elapsed;
       const info = safeError(error);
       this.state.status = "failed";
       this.state.error = `${name}: ${info.code}: ${info.message}`;
@@ -250,30 +387,53 @@ export class Mcup2imCampaign {
 
   async run(): Promise<Mcup2imState> {
     try {
+      if (this.priorAttempts) {
+        this.ledger({ kind: "parent_attempt_linked", ...this.priorAttempts });
+      }
       await this.stage("prepare", () => this.ensureTarget());
       await this.stage("model", () => this.ensureModel());
       await this.stage("discover_seg1", () => this.discoverSegment(false));
       await this.stage("slice", () => this.slice());
-      await this.stage("analyze_and_propose", () => this.options.mode === "real" ? this.analyzeWithAgent() : this.analyzeOffline());
+      await this.stage("analyze_and_propose", () =>
+        this.options.mode === "real" ? this.analyzeWithAgent() : this.analyzeSkipped(this.options.mode));
       await this.stage("discover_seg2", () => this.discoverSegment(true));
-      await this.stage("triage_and_verify", () => this.options.mode === "real" ? this.triageWithAgent() : this.triageHost());
-      await this.stage("score", async () => { this.score(); });
-      this.state.status = this.stopped ? "partial" : "completed";
+      await this.stage("triage_and_verify", () =>
+        this.options.mode === "real" && this.limits.replay_model_calls > 0 ? this.triageWithAgent() : this.triageHost());
+      await this.stage("score", async () => {
+        const preCoverageWallMs = this.governance.activeMs;
+        this.score(preCoverageWallMs, 0, true);
+        if (this.options.config.collect_coverage && this.state.segments.length > 0) {
+          const covStarted = Date.now();
+          await this.maybeCollectCoverage();
+          const covWallMs = Math.max(0, Date.now() - covStarted);
+          this.score(preCoverageWallMs, covWallMs, false);
+        }
+      });
+      const finalStatus = (this.stopped || this.budgetTruncated) ? "partial" : "completed";
+      this.state.status = finalStatus;
+      this.governance.finish(finalStatus);
+      await this.publish("run_completed");
+      return this.state;
     } catch (error) {
       const info = safeError(error);
-      this.state.status = error instanceof BudgetError ? "partial" : "failed";
+      const errStatus = error instanceof BudgetError ? "partial" : "failed";
+      this.state.status = errStatus;
       if (!this.state.error) this.state.error = `${info.code}: ${info.message}`;
-      this.governance.finish(error instanceof BudgetError ? "partial" : "failed");
+      if (error instanceof BudgetError && this.state.segments.length > 0 && !existsSync(join(this.directory, "score-owned.json"))) {
+        try { this.score(this.governance.activeMs, 0, true); } catch { /* best-effort partial score */ }
+      }
+      this.governance.finish(errStatus);
       await this.publish("run_failed");
       throw error;
     }
-    this.governance.finish("completed");
-    await this.publish("run_completed");
-    return this.state;
   }
 
   private async ensureTarget(): Promise<void> {
     if (this.options.skipPrepare) return;
+    if (this.options.resumeAttemptId && this.state.rounds.length > 0 && existsSync(join(this.workDir(), "meta.json"))) {
+      this.ledger({ kind: "stage_resumed", stage: "prepare", work_dir: this.state.work_dir });
+      return;
+    }
     const prepareArgv = [
       "prepare", "--target", this.options.config.target, "--elf", this.options.config.elf,
       "--expect-sha256", this.options.config.elf_sha256,
@@ -283,10 +443,17 @@ export class Mcup2imCampaign {
     if (this.options.config.auto_forkserver_pc) {
       prepareArgv.push("--auto-forkserver-pc", this.options.config.auto_forkserver_pc);
     }
+    if (this.options.config.trial_seed !== null) {
+      prepareArgv.push("--trial-seed", String(this.options.config.trial_seed));
+    }
     const payload = await this.oracleCall<{ ok: boolean; work_dir: string; elf_sha256: string }>(prepareArgv, 180_000);
     requireThat(payload.elf_sha256 === this.options.config.elf_sha256, "TARGET_HASH_MISMATCH",
       "The oracle prepared a different image hash");
-    this.ledger({ kind: "target_prepared", work_dir: payload.work_dir, elf_sha256: payload.elf_sha256 });
+    if (payload.work_dir) this.state.work_dir = payload.work_dir;
+    this.ledger({
+      kind: "target_prepared", work_dir: payload.work_dir, elf_sha256: payload.elf_sha256,
+      trial_seed: this.options.config.trial_seed,
+    });
   }
 
   private async ensureModel(): Promise<void> {
@@ -318,12 +485,30 @@ export class Mcup2imCampaign {
         unique_hangs: Number(row.unique_hangs ?? 0), queue_files: Number(row.queue_files ?? 0),
         crash_files: Number(row.crash_files ?? 0),
         bitmap_cvg: row.bitmap_cvg === undefined || row.bitmap_cvg === null ? null : String(row.bitmap_cvg),
+        inherit_queue: row.inherit_queue === undefined || row.inherit_queue === null ? null : String(row.inherit_queue),
+        inherited_queue_files: Number(row.inherited_queue_files ?? 0),
+        proposed_seeds: Number(row.proposed_seeds ?? 0),
+        max_execs: row.max_execs === undefined || row.max_execs === null ? null : Number(row.max_execs),
+        exec_cap_reached: Boolean(row.exec_cap_reached),
       });
     }
     return out;
   }
 
-  private async runSegment(seconds: number, includeProposed = false): Promise<Mcup2imSegmentSummary> {
+  private async emitWarning(warning: string, eventSuffix: string, extraLedger?: Record<string, unknown>): Promise<void> {
+    this.warnings.push(warning);
+    this.state.warnings = [...this.warnings];
+    this.state.model_diagnostics.warnings = [...this.warnings];
+    if (extraLedger) this.ledger(extraLedger);
+    await this.publish(`warning:${eventSuffix}`);
+  }
+
+  private async runSegment(
+    seconds: number,
+    includeProposed = false,
+    inheritQueue: string | null = null,
+    maxExecs: number | null = null,
+  ): Promise<Mcup2imSegmentSummary> {
     this.charge();
     const index = this.state.segments.length + 1;
     const argv = [
@@ -331,32 +516,119 @@ export class Mcup2imCampaign {
       "--seconds", String(seconds), "--work-root", this.options.config.work_root,
     ];
     if (includeProposed) argv.push("--include-proposed");
+    if (inheritQueue) argv.push("--inherit-queue", inheritQueue);
+    if (maxExecs !== null) argv.push("--max-execs", String(maxExecs));
     const payload = await this.oracleCall<{ segment: Record<string, unknown> }>(argv, (seconds + 240) * 1000);
     const summary = this.segmentRows([payload.segment])[0]!;
     this.state.segments.push(summary);
     this.state.totals.target_execs += summary.execs_done;
-    this.ledger({ kind: "segment_done", segment: summary.segment, execs: summary.execs_done, crashes: summary.crash_files });
+    this.ledger({
+      kind: "segment_done", segment: summary.segment, execs: summary.execs_done, crashes: summary.crash_files,
+      inherit_queue: inheritQueue, inherited_queue_files: summary.inherited_queue_files,
+      proposed_seeds: summary.proposed_seeds, max_execs: maxExecs, exec_cap_reached: summary.exec_cap_reached ?? false,
+    });
     await this.publish("segment_done");
     return summary;
   }
 
-  /** seg1 is the trace window. seg2 runs only when a second segment is budgeted and includes admitted seeds. */
+  /** seg1 is the trace window. seg2 runs only when budgeted and inherits s1 queue (plus admitted seeds). */
   private async discoverSegment(second: boolean): Promise<void> {
+    if (!second && this.discoveryStartedAt === null) {
+      this.discoveryStartedAt = Date.now();
+    }
+    if (this.options.resumeAttemptId) {
+      if (!second && this.state.segments.length >= 1) {
+        this.ledger({ kind: "stage_resumed", stage: "discover_seg1", existing_segments: this.state.segments.length });
+        return;
+      }
+      if (second && this.state.segments.length >= 2) {
+        this.ledger({ kind: "stage_resumed", stage: "discover_seg2", existing_segments: this.state.segments.length });
+        return;
+      }
+    }
+    if (second && this.options.mode === "b0") {
+      this.ledger({ kind: "segment_skipped", which: "seg2", reason: "b0_single_segment" });
+      return;
+    }
     const cap = this.options.config.max_segments;
     const allowed = second ? cap >= 2 : cap >= 1;
     if (!allowed || this.state.segments.length >= cap) {
       this.ledger({ kind: "segment_skipped", which: second ? "seg2" : "seg1", max_segments: cap });
       return;
     }
-    if (this.stopped || this.governance.activeMs > this.limits.wall_ms * 0.8) return;
+    if (this.stopped) return;
+
+    const fuzzBudgetS = this.options.config.fuzz_budget_s;
+    let segSeconds: number;
+    if (fuzzBudgetS !== null) {
+      if (this.options.mode === "b0") {
+        segSeconds = fuzzBudgetS;
+      } else if (!second) {
+        segSeconds = Math.min(this.options.config.segment_seconds, fuzzBudgetS);
+      } else {
+        const elapsedS = this.discoveryStartedAt !== null
+          ? (Date.now() - this.discoveryStartedAt) / 1000
+          : ((this.state.stage_wall_ms.discover_seg1 ?? 0)
+            + (this.state.stage_wall_ms.slice ?? 0)
+            + (this.state.stage_wall_ms.analyze_and_propose ?? 0)) / 1000;
+        segSeconds = Math.floor(fuzzBudgetS - elapsedS);
+        if (segSeconds < 15) {
+          this.budgetTruncated = true;
+          await this.emitWarning(
+            `SEG2_SKIPPED_WALL_BUDGET: remaining fuzz_budget_s (${segSeconds}s of ${fuzzBudgetS}s) is below 15s minimum after seg1+slice+analyze; marking run partial`,
+            "seg2_skipped_wall_budget",
+            { kind: "segment_skipped", which: "seg2", reason: "fuzz_budget_exhausted", remaining_s: segSeconds, fuzz_budget_s: fuzzBudgetS },
+          );
+          return;
+        }
+      }
+    } else {
+      segSeconds = this.options.config.segment_seconds;
+      const remainingWallS = Math.floor((this.limits.wall_ms - this.governance.activeMs) / 1000);
+      if (remainingWallS < Math.min(segSeconds, 15) + 30) {
+        this.budgetTruncated = true;
+        await this.emitWarning(
+          `SEG2_SKIPPED_WALL_BUDGET: remaining host wall_ms (${remainingWallS}s) cannot fit ${second ? "seg2" : "seg1"} (${segSeconds}s); marking run partial`,
+          "seg2_skipped_wall_budget",
+          { kind: "segment_skipped", which: second ? "seg2" : "seg1", reason: "host_wall_budget_low", remaining_wall_s: remainingWallS },
+        );
+        return;
+      }
+    }
+
+    const maxExecs = this.options.config.max_execs;
+    let segMaxExecs: number | null = null;
+    if (maxExecs !== null) {
+      if (this.options.mode === "b0") {
+        segMaxExecs = maxExecs;
+      } else if (!second) {
+        segMaxExecs = Math.max(1, Math.floor(maxExecs / 2));
+      } else {
+        const remainingExecs = maxExecs - this.state.totals.target_execs;
+        if (remainingExecs <= 0) {
+          this.ledger({ kind: "segment_skipped", which: "seg2", reason: "max_execs_reached", max_execs: maxExecs });
+          return;
+        }
+        segMaxExecs = remainingExecs;
+      }
+    }
+
     const includeProposed = second && this.admittedSeeds.length > 0;
-    await this.runSegment(this.options.config.segment_seconds, includeProposed);
-    this.ledger({ kind: second ? "discover_seg2" : "discover_seg1", include_proposed: includeProposed,
-      admitted_seeds: this.admittedSeeds.length });
+    const prevSeg = this.state.segments.at(-1)?.segment ?? null;
+    const inheritQueue = second && this.options.config.inherit_queue_s2 ? prevSeg : null;
+    await this.runSegment(segSeconds, includeProposed, inheritQueue, segMaxExecs);
+    this.ledger({
+      kind: second ? "discover_seg2" : "discover_seg1",
+      requested_seconds: segSeconds,
+      max_execs: segMaxExecs,
+      include_proposed: includeProposed,
+      inherit_queue: inheritQueue,
+      admitted_seeds: this.admittedSeeds.length,
+    });
   }
 
-  private async analyzeOffline(): Promise<void> {
-    this.ledger({ kind: "analyze_skipped", reason: "offline", paths_reads: 0, admitted_seeds: 0 });
+  private async analyzeSkipped(reason: Mcup2imMode): Promise<void> {
+    this.ledger({ kind: "analyze_skipped", reason, paths_reads: 0, admitted_seeds: 0 });
   }
 
   private async analyzeWithAgent(): Promise<void> {
@@ -390,8 +662,25 @@ export class Mcup2imCampaign {
     } finally {
       await this.closeSession(handle, "finished");
     }
+    const lengthTruncations = this.analyzeStopReasons.length ?? 0;
+    if (lengthTruncations > 0 && this.admittedSeeds.length === 0) {
+      const warning = `ANALYZE_TRUNCATED_ZERO_SEEDS: analyze_and_propose hit stop_reason="length" ${lengthTruncations} time(s) (thinking=${this.state.model_diagnostics.thinking ?? "unknown"}, max_output_tokens=${this.limits.max_output_tokens}) and admitted 0 seeds; consider --thinking low or raising --max-output-tokens`;
+      this.warnings.push(warning);
+      this.state.warnings = [...this.warnings];
+      this.state.model_diagnostics.warnings = [...this.warnings];
+      this.ledger({
+        kind: "analyze_warning",
+        code: "ANALYZE_TRUNCATED_ZERO_SEEDS",
+        length_truncations: lengthTruncations,
+        admitted_seeds: 0,
+        thinking: this.state.model_diagnostics.thinking,
+        max_output_tokens: this.limits.max_output_tokens,
+      });
+      await this.publish("warning:analyze_truncated_zero_seeds");
+    }
     this.ledger({ kind: "analyze_done", paths_reads: this.analyzeReads,
-      admitted_seeds: this.admittedSeeds.length, hypotheses: this.hypotheses.length });
+      admitted_seeds: this.admittedSeeds.length, hypotheses: this.hypotheses.length,
+      stop_reasons: { ...this.analyzeStopReasons } });
   }
 
   private async fetchCrashes(): Promise<Mcup2imCrashRow[]> {
@@ -436,12 +725,16 @@ export class Mcup2imCampaign {
   }
 
   private async judgeCrashes(rows: Mcup2imCrashRow[], useAgent: boolean): Promise<void> {
-    const limit = Math.max(1, Math.min(rows.length, 8));
-    const selected = rows.slice(0, limit);
-    for (const row of selected) {
+    const runAgent = useAgent && this.limits.replay_model_calls > 0;
+    const ordered = interleaveCrashRows(rows);
+    const selected = ordered.slice(0, Math.min(ordered.length, 64));
+    const confirmedFingerprints = new Set<string>();
+    const contrastAttemptsByFp = new Map<string, number>();
+    for (let index = 0; index < selected.length; index += 1) {
+      const row = selected[index]!;
       if (this.stopped) break;
       try {
-        if (useAgent) {
+        if (runAgent && index < 8) {
           const handle = await this.openSession("replay", this.limits.replay_model_calls);
           try {
             await this.prompt(handle, JSON.stringify({
@@ -452,11 +745,20 @@ export class Mcup2imCampaign {
             await this.closeSession(handle, "finished");
           }
           if (!this.replayCache.has(row.sha256)) await this.replayCrash(row);
-          const first = this.replayCache.get(row.sha256)?.[0];
-          if (first?.outcome === "crash" && !this.contrastCache.has(row.sha256)) await this.contrastCrash(row);
         } else {
-          const replays = await this.replayCrash(row);
-          if (replays[0]?.outcome === "crash") await this.contrastCrash(row);
+          await this.replayCrash(row);
+        }
+        const first = this.replayCache.get(row.sha256)?.[0];
+        if (first?.outcome === "crash") {
+          const fp = crashFingerprint(first);
+          const existingContrast = this.contrastCache.get(row.sha256);
+          if (existingContrast?.contrast_confirmed === true) {
+            confirmedFingerprints.add(fp);
+          } else if (!existingContrast && !confirmedFingerprints.has(fp) && (contrastAttemptsByFp.get(fp) ?? 0) < 2) {
+            const contrast = await this.contrastCrash(row);
+            contrastAttemptsByFp.set(fp, (contrastAttemptsByFp.get(fp) ?? 0) + 1);
+            if (contrast?.contrast_confirmed === true) confirmedFingerprints.add(fp);
+          }
         }
         await this.maybeWatch(row);
       } catch (error) {
@@ -468,15 +770,44 @@ export class Mcup2imCampaign {
 
   private async triageHost(): Promise<void> {
     const rows = await this.fetchCrashes();
+    this.ledger({
+      kind: "triage_mode",
+      mode: "host_deterministic",
+      replay_model_calls: this.limits.replay_model_calls,
+      crashes: rows.length,
+    });
     await this.judgeCrashes(rows, false);
   }
 
   private async triageWithAgent(): Promise<void> {
     const rows = await this.fetchCrashes();
+    this.ledger({
+      kind: "triage_mode",
+      mode: "agent",
+      replay_model_calls: this.limits.replay_model_calls,
+      crashes: rows.length,
+    });
     await this.judgeCrashes(rows, true);
   }
 
   private async slice(): Promise<void> {
+    const existingPaths = join(this.workDir(), "analysis", "paths.json");
+    if (this.options.resumeAttemptId && this.state.artifacts.paths && existsSync(existingPaths)) {
+      const parsed = this.loadPaths();
+      this.sliceSummary = (parsed?.counts as Record<string, unknown> | undefined) ?? null;
+      this.sharedBrief = Array.isArray(parsed?.shared_globals) ? parsed.shared_globals : [];
+      for (const name of ["sources.json", "paths.json"]) {
+        const path = join(this.workDir(), "analysis", name);
+        if (!existsSync(path)) continue;
+        const body = readFileSync(path);
+        const digest = sha256(body);
+        this.artifactIndex.set(digest, path);
+        this.state.artifacts[name.replace(".json", "")] = digest;
+        assertNoLeak(body.toString("utf8"), name);
+      }
+      this.ledger({ kind: "stage_resumed", stage: "slice" });
+      return;
+    }
     this.charge();
     await this.oracleCall([
       "extract-sources", "--target", this.options.config.target, "--work-root", this.options.config.work_root,
@@ -497,7 +828,7 @@ export class Mcup2imCampaign {
       this.state.artifacts[name.replace(".json", "")] = digest;
       assertNoLeak(body.toString("utf8"), name);
     }
-    this.ledger({ kind: "slice_done", counts: payload.counts });
+    this.ledger({ kind: "slice_done", counts: payload.counts, posthoc_attribution_only: this.options.mode === "b0" });
     await this.publish("slice_done");
   }
 
@@ -562,14 +893,59 @@ export class Mcup2imCampaign {
     return join(this.options.config.work_root, slug);
   }
 
-  private score(): void {
+  private async maybeCollectCoverage(): Promise<void> {
+    if (!this.options.config.collect_coverage) return;
+    if (this.state.segments.length === 0) return;
+    try {
+      const payload = await this.oracleCall<{ coverage: Record<string, unknown>; coverage_path?: string }>([
+        "bbl-coverage", "--target", this.options.config.target,
+        "--work-root", this.options.config.work_root,
+      ], 1_800_000);
+      this.state.coverage = payload.coverage;
+      if (payload.coverage_path) this.state.artifacts.bbl_coverage = payload.coverage_path;
+      this.ledger({ kind: "bbl_coverage", union: payload.coverage.union ?? null });
+      await this.publish("coverage_ready");
+    } catch (error) {
+      const info = safeError(error);
+      await this.emitWarning(
+        `COVERAGE_COLLECTION_FAILED: ${info.code}: ${info.message}`,
+        "coverage_collection_failed",
+        { kind: "bbl_coverage_failed", code: info.code, message: info.message },
+      );
+    }
+  }
+
+  private score(preCoverageWallMs = this.governance.activeMs, evalCoverageWallMs = 0, emitCandidates = true): void {
     const rows = [...this.replayCache.values()].map(group => group[0]).filter(Boolean) as Mcup2imReplayRow[];
     const crashRows = rows.filter(row => row.outcome === "crash");
-    const uniqueFingerprints = new Set(crashRows.map(row => `${row.fault?.kind}|${row.fault?.address}|${row.last_bbl?.function}`));
+    const uniqueFingerprints = new Set(crashRows.map(crashFingerprint));
     const deterministic = crashRows.filter(row => (row as unknown as Record<string, unknown>).deterministic === true);
-    const contrasts = [...this.contrastCache.entries()];
-    const confirmed = contrasts.filter(([, value]) => value.contrast_confirmed === true);
-    this.state.layers = { l1: this.state.crashes.raw_files, l2: uniqueFingerprints.size, l3: deterministic.length, l4: confirmed.length };
+    const deterministicFingerprints = new Set(deterministic.map(crashFingerprint));
+    const confirmedFingerprints = new Set<string>();
+    let confirmedFileCount = 0;
+    for (const [digest, group] of this.replayCache.entries()) {
+      const first = group[0];
+      if (first?.outcome !== "crash") continue;
+      const contrast = this.contrastCache.get(digest);
+      if (contrast?.contrast_confirmed === true) {
+        confirmedFileCount += 1;
+        if ((first as unknown as Record<string, unknown>).deterministic === true) {
+          confirmedFingerprints.add(crashFingerprint(first));
+        }
+      }
+    }
+    this.state.layers = {
+      l1: Math.max(this.state.crashes.raw_files, crashRows.length),
+      l2: uniqueFingerprints.size,
+      l3: deterministicFingerprints.size,
+      l4: confirmedFingerprints.size,
+    };
+    this.state.layers_files = {
+      l1: this.state.crashes.raw_files,
+      l2: crashRows.length,
+      l3: deterministic.length,
+      l4: confirmedFileCount,
+    };
     this.state.crashes.replayed = rows.length;
     this.state.crashes.reproduced = crashRows.length;
     const detail = [...this.replayCache.entries()].map(([digest, group]) => ({
@@ -577,49 +953,146 @@ export class Mcup2imCampaign {
       deterministic: (group[0] as unknown as Record<string, unknown>).deterministic === true,
       contrast: this.contrastCache.get(digest) ?? null,
     }));
+    const totalExecsDone = this.state.segments.reduce((sum, row) => sum + row.execs_done, 0);
+    const fuzzWallMs = (this.state.stage_wall_ms.discover_seg1 ?? 0) + (this.state.stage_wall_ms.discover_seg2 ?? 0);
+    const sliceWallMs = this.state.stage_wall_ms.slice ?? 0;
+    const llmWallMs = this.state.stage_wall_ms.analyze_and_propose ?? 0;
+    const triageWallMs = this.state.stage_wall_ms.triage_and_verify ?? 0;
+    const discoveryGuidanceWallMs = this.options.mode === "b0"
+      ? (this.state.stage_wall_ms.discover_seg1 ?? 0)
+      : fuzzWallMs + sliceWallMs + llmWallMs;
+    const cumulativeCost = this.priorAttempts ? {
+      parent_out: this.priorAttempts.parent_out,
+      parent_run_id: this.priorAttempts.parent_run_id,
+      parent_attempt_id: this.priorAttempts.parent_attempt_id,
+      total_model_requests: this.priorAttempts.prior_model_requests + this.governance.account.requests.length,
+      total_tokens: this.priorAttempts.prior_tokens + this.governance.account.tokens,
+      total_active_ms: this.priorAttempts.prior_active_ms + preCoverageWallMs,
+      total_target_execs: this.priorAttempts.prior_target_execs + totalExecsDone,
+    } : null;
     const body = {
-      schema: "mcu-p2im/score-owned-0.2", target: this.options.config.target,
-      elf_sha256: this.options.config.elf_sha256, model_requests: this.governance.account.requests.length,
-      tokens: this.governance.account.tokens, segments: this.state.segments,
-      layers: this.state.layers, detail,
-      note: "L1..L4 only. L5 (known-bug truth comparison) is a separate offline host step and is not part of this run.",
+      schema: "mcu-p2im/score-owned-0.3", target: this.options.config.target,
+      mode: this.options.mode,
+      trial_seed: this.options.config.trial_seed,
+      elf_sha256: this.options.config.elf_sha256,
+      work_root: this.options.config.work_root,
+      work_dir: this.state.work_dir,
+      model_requests: this.governance.account.requests.length,
+      tokens: this.governance.account.tokens,
+      total_execs_done: totalExecsDone,
+      prior_attempts: this.priorAttempts,
+      cumulative_cost: cumulativeCost,
+      stage_wall_ms: this.state.stage_wall_ms,
+      wall_clock: {
+        end_to_end_wall_ms: preCoverageWallMs,
+        discovery_guidance_wall_ms: discoveryGuidanceWallMs,
+        fuzz_wall_ms: fuzzWallMs,
+        slice_wall_ms: sliceWallMs,
+        llm_wall_ms: llmWallMs,
+        triage_wall_ms: triageWallMs,
+        eval_coverage_wall_ms: evalCoverageWallMs,
+      },
+      model_diagnostics: this.state.model_diagnostics,
+      warnings: this.state.warnings,
+      coverage: this.state.coverage ?? null,
+      segments: this.state.segments,
+      layers: this.state.layers,
+      layers_files: this.state.layers_files,
+      detail,
+      note: "L1..L4 only (L2..L4 deduplicated by crash fingerprint; raw witness counts in layers_files). L5 (known-bug truth comparison) is a separate offline host step.",
       instruction_authority: "none",
     };
     writeJson(join(this.directory, "score-owned.json"), body);
     this.state.artifacts.score_owned = sha256(JSON.stringify(body));
-    const candidates = detail
-      .filter(entry => entry.replay?.outcome === "crash" && entry.deterministic)
-      .map(entry => {
-        const replay = entry.replay!;
-        const link = this.upstreamFor(replay.last_bbl?.function ?? "");
-        const addresses = [replay.fault?.address, replay.last_bbl?.start].filter((value): value is string => Boolean(value));
-        return {
-          target: this.options.config.target,
-          function: replay.last_bbl?.function ?? "",
-          addresses,
-          upstream_functions: link.upstream,
-          via_shared_global: link.via,
-          adjacent_global: link.adjacent,
-          layout: link.adjacent ? "symbol_adjacency" : null,
-        };
+    if (!emitCandidates) return;
+
+    const candidateMap = new Map<string, {
+      target: string;
+      function: string;
+      addresses: string[];
+      bbl_range: [string, string] | null;
+      upstream_functions: string[];
+      via_shared_global: string | null;
+      adjacent_global: string | null;
+      layout: string | null;
+      witness_count: number;
+    }>();
+    for (const entry of detail) {
+      if (entry.replay?.outcome !== "crash" || !entry.deterministic) continue;
+      const replay = entry.replay;
+      const key = `${replay.last_bbl?.function ?? ""}|${replay.last_bbl?.start ?? ""}|${replay.last_bbl?.end ?? ""}|${replay.fault?.kind ?? ""}|${replay.fault?.address ?? ""}`;
+      const existing = candidateMap.get(key);
+      if (existing) {
+        existing.witness_count += 1;
+        continue;
+      }
+      const link = this.upstreamFor(replay.last_bbl?.function ?? "");
+      const addresses = [...new Set([replay.fault?.address, replay.last_bbl?.start].filter((value): value is string => Boolean(value)))];
+      candidateMap.set(key, {
+        target: this.options.config.target,
+        function: replay.last_bbl?.function ?? "",
+        addresses,
+        bbl_range: replay.last_bbl ? [replay.last_bbl.start, replay.last_bbl.end] : null,
+        upstream_functions: link.upstream,
+        via_shared_global: link.via,
+        adjacent_global: link.adjacent,
+        layout: link.adjacent ? "symbol_adjacency" : null,
+        witness_count: 1,
       });
-    writeJson(join(this.directory, "l5-candidates.json"), {
-      schema: "mcu-p2im/l5-candidates-0.3", target: this.options.config.target,
-      elf_sha256: this.options.config.elf_sha256, hypotheses: this.hypotheses,
+    }
+    const candidates = [...candidateMap.values()];
+    const bareCandidates = candidates.map(item => ({
+      target: item.target,
+      function: item.function,
+      addresses: item.addresses,
+      bbl_range: item.bbl_range,
+      upstream_functions: [] as string[],
+      via_shared_global: null,
+      adjacent_global: null,
+      layout: null,
+      witness_count: item.witness_count,
+    }));
+    const l5Digest = writeJson(join(this.directory, "l5-candidates.json"), {
+      schema: "mcu-p2im/l5-candidates-0.4", target: this.options.config.target,
+      mode: this.options.mode,
+      trial_seed: this.options.config.trial_seed,
+      elf_sha256: this.options.config.elf_sha256,
+      work_root: this.options.config.work_root,
+      work_dir: this.state.work_dir,
+      attribution_mode: "with_shared_sram_slice",
+      hypotheses: this.hypotheses,
       admitted_seeds: this.admittedSeeds.map(seed => ({ sha256: seed.sha256, bytes: seed.bytes, frame: seed.frame })),
       candidates, instruction_authority: "none",
     });
-    this.ledger({ kind: "score", layers: this.state.layers, l5_candidates: candidates.length });
+    const bareDigest = writeJson(join(this.directory, "l5-candidates-bare.json"), {
+      schema: "mcu-p2im/l5-candidates-0.4", target: this.options.config.target,
+      mode: this.options.mode,
+      trial_seed: this.options.config.trial_seed,
+      elf_sha256: this.options.config.elf_sha256,
+      work_root: this.options.config.work_root,
+      work_dir: this.state.work_dir,
+      attribution_mode: "bare_without_sram_slice",
+      hypotheses: [],
+      admitted_seeds: [],
+      candidates: bareCandidates, instruction_authority: "none",
+    });
+    this.state.artifacts.l5_candidates = l5Digest;
+    this.state.artifacts.l5_candidates_bare = bareDigest;
+    this.ledger({ kind: "score", layers: this.state.layers, layers_files: this.state.layers_files, l5_candidates: candidates.length });
   }
 
   // ------------------------------------------------------------------ sessions
 
   private async sessionBinding(role: Mcup2imRole): Promise<PiBinding> {
     if (this.options.bindingFactory) return this.options.bindingFactory(role, this.internal.signal);
-    if (this.options.mode === "offline") {
-      throw new DomainError("OFFLINE_NO_MODEL", "Offline mode never opens a model session");
+    if (this.options.mode !== "real") {
+      throw new DomainError("OFFLINE_NO_MODEL", `${this.options.mode} mode never opens a model session`);
     }
-    return openPiModel(this.options.selection ?? {}, process.cwd(), this.internal.signal);
+    const selection: PiSelection = {
+      ...this.options.selection,
+      thinking: this.options.selection?.thinking ?? "low",
+    };
+    return openPiModel(selection, process.cwd(), this.internal.signal);
   }
 
   private ports(role: Mcup2imRole, sessionId: string): Mcup2imToolPorts {
@@ -782,6 +1255,11 @@ export class Mcup2imCampaign {
     const directory = join(this.governance.attemptDirectory, "sessions", sessionId);
     mkdirSync(directory, { recursive: true });
     const binding = await this.sessionBinding(role);
+    const thinking = binding.thinkingLevel ?? (this.options.mode === "real" ? (this.options.selection?.thinking ?? "low") : "off");
+    this.state.model_diagnostics.provider = binding.model.provider;
+    this.state.model_diagnostics.model = binding.model.id;
+    this.state.model_diagnostics.thinking = thinking;
+    this.state.model_diagnostics.max_output_tokens = this.limits.max_output_tokens;
     const upstream = binding.runtime.streamSimple;
     let handle: SessionHandle;
     binding.runtime.streamSimple = (model, context, options) => {
@@ -809,14 +1287,21 @@ export class Mcup2imCampaign {
               const detail = event.type === "error"
                 ? String(message.errorMessage || "").replace(/sk-[A-Za-z0-9_-]{8,}/g, "[redacted]").slice(0, 300)
                 : "";
+              const stopReason = String(message.stopReason ?? "unknown");
+              this.stopReasons[stopReason] = (this.stopReasons[stopReason] ?? 0) + 1;
+              if (role === "main") {
+                this.analyzeStopReasons[stopReason] = (this.analyzeStopReasons[stopReason] ?? 0) + 1;
+              }
+              this.state.model_diagnostics.stop_reasons = { ...this.stopReasons };
+              this.state.model_diagnostics.analyze_length_truncations = this.analyzeStopReasons.length ?? 0;
               // A timeout returns no usage. Settling it as unknown freezes every later request,
               // including the session retry that would otherwise succeed. Record zero tokens and
               // leave cost null. An authentication or request error still stops the run.
               const retryable = event.type === "error" && /timed out|connection error|ECONNRESET|ETIMEDOUT|fetch failed|EAI_AGAIN|429|rate limit|overloaded/i.test(detail);
               const known = retryable || (event.type === "done" && Number.isFinite(message.usage.totalTokens) && message.usage.totalTokens > 0);
               this.governance.settle(requestId, event.type === "error" ? { totalTokens: 0 } : message.usage, known);
-              this.ledger({ kind: "model_settle", session_id: sessionId, request_id: requestId, known,
-                stop_reason: message.stopReason, ...(detail ? { error: detail } : {}) });
+              this.ledger({ kind: "model_settle", session_id: sessionId, request_id: requestId, role, thinking,
+                known, stop_reason: stopReason, ...(detail ? { error: detail } : {}) });
               if (!known) this.stop();
             }
             output.push(event);
@@ -846,7 +1331,8 @@ export class Mcup2imCampaign {
     handle = { id: sessionId, role, session: created.session, manager: created.manager, binding,
       upstream, calls: 0, cap, aborted: false };
     this.sessionIds.add(sessionId);
-    this.ledger({ kind: "session_started", session_id: sessionId, role, cap });
+    this.ledger({ kind: "session_started", session_id: sessionId, role, provider: binding.model.provider,
+      model: binding.model.id, thinking, max_output_tokens: this.limits.max_output_tokens, cap });
     return handle;
   }
 

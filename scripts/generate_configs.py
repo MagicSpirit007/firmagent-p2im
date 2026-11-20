@@ -29,14 +29,19 @@ def main() -> int:
     parser.add_argument("--out-dir", default=os.path.join(REPO_ROOT, "configs", "m3"))
     parser.add_argument("--segment-seconds", type=int, default=300)
     parser.add_argument("--fuzz-hard-cap-s", type=int, default=300)
+    parser.add_argument("--fuzz-budget-s", type=int, default=None)
+    parser.add_argument("--max-execs", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-segments", type=int, default=2)
+    parser.add_argument("--collect-coverage", action="store_true")
     parser.add_argument("--gdb-watch", action="store_true")
     args = parser.parse_args()
 
     with open(args.manifest, "r", encoding="utf-8") as handle:
         manifest = json.load(handle)
 
-    if args.segment_seconds > args.fuzz_hard_cap_s:
+    effective_hard_cap = max(args.fuzz_hard_cap_s, args.fuzz_budget_s or 0)
+    if args.segment_seconds > effective_hard_cap:
         print(json.dumps({"ok": False, "error": "segment-seconds exceeds fuzz-hard-cap-s"}), file=sys.stderr)
         return 3
 
@@ -47,14 +52,14 @@ def main() -> int:
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Check P2IM AFL -c (< 100 byte) limit on longest target slug + longest round model filename.
-    max_slug = max(t["target"].lower().replace("_", "-") for t in manifest["targets"])
-    longest_model_path = os.path.join(work_root, max_slug, "0.random.1", "peripheral_model.json")
-    if len(longest_model_path) >= 100:
+    max_slug = max((t["target"].lower().replace("_", "-") for t in manifest["targets"]), key=len)
+    longest_model_path = os.path.join(work_root, max_slug, "0.seed-random.10", "peripheral_model.json")
+    if len(longest_model_path.encode("utf-8")) >= 100:
         print(json.dumps({
             "ok": False,
             "error": "work-root exceeds P2IM AFL -c <100 byte limit",
             "example_path": longest_model_path,
-            "bytes": len(longest_model_path),
+            "bytes": len(longest_model_path.encode("utf-8")),
         }), file=sys.stderr)
         return 3
 
@@ -75,14 +80,18 @@ def main() -> int:
             "runner": "",
             "python": "python3",
             "wsl_distro": None,
-            "fuzz_hard_cap_s": args.fuzz_hard_cap_s,
+            "fuzz_hard_cap_s": effective_hard_cap,
             "segment_seconds": args.segment_seconds,
             "max_segments": args.max_segments,
+            "fuzz_budget_s": args.fuzz_budget_s,
+            "max_execs": args.max_execs,
+            "trial_seed": args.seed,
             "replay_repeat": 3,
             "contrast_budget": 1,
             "max_contrast_replays": 40,
             "auto_forkserver_pc": entry.get("auto_forkserver_pc") or None,
             "gdb_watch": bool(args.gdb_watch),
+            "collect_coverage": bool(args.collect_coverage),
         }
         out_path = os.path.join(args.out_dir, f"{slug}.json")
         with open(out_path, "w", encoding="utf-8", newline="\n") as handle:

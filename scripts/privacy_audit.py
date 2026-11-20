@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sys
@@ -28,25 +29,36 @@ FORBIDDEN_REGEXES = (
     re.compile(r"BEGIN\s+(?:RSA|OPENSSH|EC|DSA)?\s*PRIVATE\s+KEY"),
 )
 
+BUILD_ARTIFACT_DIRS = {"node_modules", "dist", "__pycache__"}
 FORBIDDEN_DIR_NAMES = {".git" + "_ignore_none", "node_modules", "dist", "__pycache__", "runs", "work", "deps"}
 FORBIDDEN_FILE_NAMES = {"auth.json", ".env"}
 
 
-def main() -> int:
-    hits = []
-    for root, dirs, files in os.walk(REPO_ROOT):
-        dirs[:] = [d for d in dirs if d != ".git"]
-        for d in dirs:
+def audit_repo(root_dir: str = REPO_ROOT, ignore_build_artifacts: bool = False) -> list[dict]:
+    scan_root = os.path.abspath(root_dir)
+    hits: list[dict] = []
+    for root, dirs, files in os.walk(scan_root):
+        kept_dirs = []
+        for d in sorted(dirs):
+            if d == ".git":
+                continue
             if d in FORBIDDEN_DIR_NAMES:
-                hits.append({"path": os.path.relpath(os.path.join(root, d), REPO_ROOT), "reason": f"forbidden_dir:{d}"})
-        for name in files:
+                if not (ignore_build_artifacts and d in BUILD_ARTIFACT_DIRS):
+                    hits.append({"path": os.path.relpath(os.path.join(root, d), scan_root), "reason": f"forbidden_dir:{d}"})
+                continue
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
+        for name in sorted(files):
+            if ignore_build_artifacts and name.endswith(".pyc"):
+                continue
             full = os.path.join(root, name)
-            rel = os.path.relpath(full, REPO_ROOT)
+            rel = os.path.relpath(full, scan_root)
             if name in FORBIDDEN_FILE_NAMES or name.startswith(".env.") or name.endswith(".pyc") or name.endswith(".tar.zst"):
                 hits.append({"path": rel, "reason": f"forbidden_file:{name}"})
                 continue
             try:
-                raw = open(full, "rb").read()
+                with open(full, "rb") as handle:
+                    raw = handle.read()
             except OSError as exc:
                 hits.append({"path": rel, "reason": f"unreadable:{exc}"})
                 continue
@@ -60,8 +72,22 @@ def main() -> int:
             for regex in FORBIDDEN_REGEXES:
                 if regex.search(text):
                     hits.append({"path": rel, "reason": f"forbidden_regex:{regex.pattern}"})
+    return hits
 
-    print(f"privacy_audit: scanned {REPO_ROOT}, hits={len(hits)}")
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Pre-publish privacy, secret, and build-artifact audit.")
+    parser.add_argument("--root", default=REPO_ROOT, help="Repository root directory to audit.")
+    parser.add_argument(
+        "--ignore-build-artifacts",
+        action="store_true",
+        help="Skip node_modules/, dist/, __pycache__/, and *.pyc while still auditing source secrets and literals.",
+    )
+    args = parser.parse_args(argv)
+    scan_root = os.path.abspath(args.root)
+    hits = audit_repo(scan_root, ignore_build_artifacts=args.ignore_build_artifacts)
+
+    print(f"privacy_audit: scanned {scan_root}, hits={len(hits)}")
     for item in hits:
         print(f"  [FAIL] {item['path']}: {item['reason']}")
     return 0 if not hits else 1
